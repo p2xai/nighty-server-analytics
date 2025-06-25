@@ -56,18 +56,6 @@ server_analytics/
 - API endpoints for automation and integration
 - SQLite backend for portability
 
----
-
-## Components
-
-### server_analytics.py
-- Collects and stores member snapshots, demographics, and server statistics in SQLite
-- Supports periodic/manual snapshots, data retention, export, and migration
-- Provides CLI and micro-API for automation
-
-### analytics_dashboard.py
-- Flask web application for viewing, searching, and managing analytics data
-- Integrated dashboard, configuration, and search interface
 
 ---
 
