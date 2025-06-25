@@ -18,10 +18,9 @@
    ```sh
    pip install flask requests
    ```
-3. **Start the analytics script in Nighty**
+3. **Toggle the analytics script in Nighty**
    ```sh
-   python server_analytics.py
-   # In Nighty/Discord run:
+   # In Discord run:
    <p>analytics api start
    ```
 4. **Start the dashboard:**
