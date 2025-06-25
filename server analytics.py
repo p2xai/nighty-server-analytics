@@ -1,5 +1,5 @@
 @nightyScript(
-    name="Server Analytics - DB Edition",
+    name="Server Analytics - SQLite Edition",
     author="thedorekaczynski",
     description="Discord server member tracking and analytics system with growth trends (SQLite backend)",
     usage="""
@@ -79,6 +79,7 @@ def server_analytics():
     from aiohttp import web
     import os
     import shutil
+    import traceback
 
     # Constants
     DEFAULT_AUTO_SNAPSHOT_INTERVAL_HOURS = 20
@@ -630,28 +631,37 @@ def server_analytics():
             current_private = getConfigData().get("private")
             try:
                 msg = await ctx.send("generating analytics report...")
-                # Fetch all snapshots for this guild from the database
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
+                c.execute("SELECT COUNT(*) FROM snapshots WHERE guild_id = ?", (str(ctx.guild.id),))
+                snap_count = c.fetchone()[0]
+
+                if snap_count < 2:
+                    error_msg = "Not enough data to generate a report. "
+                    if not is_db_migrated():
+                        error_msg += "Your data may still be in JSON format. Please run `<p>analytics migrate`."
+                        script_log(f"Report generation failed for guild {ctx.guild.id}: DB not migrated.", level="ERROR")
+                    else:
+                        error_msg += f"Found only {snap_count} snapshot(s). A minimum of 2 is required. Please use `<p>analytics snapshot` to create more."
+                        script_log(f"Report generation failed for guild {ctx.guild.id}: Insufficient snapshots ({snap_count}).", level="ERROR")
+                    
+                    if msg:
+                        await msg.edit(content=error_msg)
+                    else:
+                        await ctx.send(error_msg)
+                    conn.close()
+                    return
+
                 c.execute("SELECT timestamp, member_count, channel_count, text_channels, voice_channels, categories, role_count, bots, is_auto FROM snapshots WHERE guild_id = ? ORDER BY timestamp ASC", (str(ctx.guild.id),))
                 rows = c.fetchall()
                 conn.close()
-                if len(rows) < 2:
-                    await msg.edit(content="not enough data to generate a report. please take at least 2 snapshots.")
-                    return
+
                 updateConfigData("private", False)
-                # Build snapshots list from DB rows
                 snapshots = [
                     {
-                        "timestamp": row[0],
-                        "member_count": row[1],
-                        "channel_count": row[2],
-                        "text_channels": row[3],
-                        "voice_channels": row[4],
-                        "categories": row[5],
-                        "role_count": row[6],
-                        "bots": row[7],
-                        "is_auto": bool(row[8])
+                        "timestamp": row[0], "member_count": row[1], "channel_count": row[2],
+                        "text_channels": row[3], "voice_channels": row[4], "categories": row[5],
+                        "role_count": row[6], "bots": row[7], "is_auto": bool(row[8])
                     }
                     for row in rows
                 ]
@@ -829,20 +839,6 @@ def server_analytics():
             days = 7
             if subcmd and subcmd.isdigit():
                 days = int(subcmd)
-            msg = await ctx.send(f"comparing current period with {days} days ago...")
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute("SELECT timestamp, member_count, channel_count, text_channels, voice_channels, categories, role_count, bots FROM snapshots WHERE guild_id = ? ORDER BY timestamp ASC", (str(ctx.guild.id),))
-            rows = c.fetchall()
-            conn.close()
-            if len(rows) < 2:
-                await forwardEmbedMethod(
-                    channel_id=ctx.channel.id,
-                    content="not enough data for comparison. please take at least 2 snapshots.",
-                    title=f"comparison report: last {days} days - {ctx.guild.name}",
-                    image=None
-                )
-                return
             await compare_periods(ctx, days)
             
         elif cmd == "export":
@@ -1059,72 +1055,71 @@ use `<p>analytics auto off` to disable""")
                 create_schema()
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
-                snap_count = demo_count = config_count = demo_servers_count = 0
-                fully_migrated = []
-                partial_migrated = []
-                no_valid_data = []
-                partial_details = {}
+                
+                # Migration statistics
+                migration_stats = defaultdict(lambda: {
+                    'total': 0, 'success': 0, 'skipped': 0, 'errors': []
+                })
+
                 # For each server directory
                 if not os.path.isdir(TEST_DATA_DIR):
                     await msg.edit(content=f"Test data directory not found: {TEST_DATA_DIR}")
                     return
+
                 for server_id in os.listdir(TEST_DATA_DIR):
                     server_dir = os.path.join(TEST_DATA_DIR, server_id)
                     if not os.path.isdir(server_dir):
                         continue
-                    files_found = {"snapshots": False, "demographics": False, "config": False}
-                    files_error = {"snapshots": False, "demographics": False, "config": False}
-                    # Snapshots
+
+                    script_log(f"Processing server: {server_id}", level="INFO")
+
+                    # --- Snapshots Migration ---
                     snap_path = os.path.join(server_dir, "member_snapshots.json")
                     if os.path.isfile(snap_path):
                         try:
                             with open(snap_path, "r", encoding="utf-8") as f:
-                                data = json.load(f)
-                                for snap in data.get("snapshots", []):
-                                    c.execute("""
-                                        INSERT INTO snapshots (guild_id, guild_name, timestamp, member_count, channel_count, text_channels, voice_channels, categories, role_count, bots, is_auto)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """, (
-                                        server_id,
-                                        snap.get("name"),
-                                        snap.get("timestamp"),
-                                        snap.get("member_count"),
-                                        snap.get("channel_count"),
-                                        snap.get("text_channels"),
-                                        snap.get("voice_channels"),
-                                        snap.get("categories"),
-                                        snap.get("role_count"),
-                                        snap.get("bots"),
-                                        int(snap.get("is_auto", False))
-                                    ))
-                                    snap_count += 1
-                            files_found["snapshots"] = True
-                        except Exception as e:
-                            files_error["snapshots"] = True
-                            print(f"Error migrating snapshots for {server_id}: {e}", type_="ERROR")
-                    # Demographics
+                                data = json.load(f).get("snapshots", [])
+                                migration_stats[server_id]['total'] += len(data)
+                                for i, snap in enumerate(data):
+                                    try:
+                                        c.execute("""
+                                            INSERT INTO snapshots (guild_id, guild_name, timestamp, member_count, channel_count, text_channels, voice_channels, categories, role_count, bots, is_auto)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        """, (
+                                            server_id, snap.get("name"), snap.get("timestamp"), snap.get("member_count"),
+                                            snap.get("channel_count"), snap.get("text_channels"), snap.get("voice_channels"),
+                                            snap.get("categories"), snap.get("role_count"), snap.get("bots"),
+                                            int(snap.get("is_auto", False))
+                                        ))
+                                        migration_stats[server_id]['success'] += 1
+                                    except Exception as e:
+                                        migration_stats[server_id]['skipped'] += 1
+                                        err_msg = f"Skipping malformed snapshot record #{i+1} for server {server_id}: {e}"
+                                        migration_stats[server_id]['errors'].append(err_msg)
+                                        script_log(err_msg, level="ERROR", exc_info=True)
+                        except json.JSONDecodeError as e:
+                            err_msg = f"Could not parse snapshots JSON for server {server_id}: {e}"
+                            migration_stats[server_id]['errors'].append(err_msg)
+                            script_log(err_msg, level="ERROR", exc_info=True)
+
+                    # --- Demographics Migration ---
                     demo_path = os.path.join(server_dir, "member_demographics.json")
                     if os.path.isfile(demo_path):
                         try:
                             with open(demo_path, "r", encoding="utf-8") as f:
-                                demo = json.load(f)
-                            for member_id, info in demo.items():
-                                c.execute("""
-                                    INSERT OR REPLACE INTO demographics (guild_id, member_id, name, account_created, joined_at)
-                                    VALUES (?, ?, ?, ?, ?)
-                                """, (
-                                    server_id,
-                                    member_id,
-                                    info.get("name"),
-                                    info.get("account_created"),
-                                    info.get("joined_at")
-                                ))
-                                demo_count += 1
-                            files_found["demographics"] = True
-                        except Exception as e:
-                            files_error["demographics"] = True
-                            print(f"Error migrating demographics for {server_id}: {e}", type_="ERROR")
-                    # Config
+                                demo_data = json.load(f)
+                                for member_id, info in demo_data.items():
+                                    try:
+                                        c.execute("""
+                                            INSERT OR REPLACE INTO demographics (guild_id, member_id, name, account_created, joined_at)
+                                            VALUES (?, ?, ?, ?, ?)
+                                        """, (server_id, member_id, info.get("name"), info.get("account_created"), info.get("joined_at")))
+                                    except Exception as e:
+                                        script_log(f"Skipping malformed demographics record for member {member_id} in server {server_id}: {e}", level="ERROR", exc_info=True)
+                        except json.JSONDecodeError as e:
+                            script_log(f"Could not parse demographics JSON for server {server_id}: {e}", level="ERROR", exc_info=True)
+
+                    # --- Config Migration ---
                     config_path = os.path.join(server_dir, "analytics_config.json")
                     if os.path.isfile(config_path):
                         try:
@@ -1134,54 +1129,49 @@ use `<p>analytics auto off` to disable""")
                                 INSERT OR REPLACE INTO server_config (guild_id, auto_snapshot, last_auto_snapshot, first_snapshot_date, chart_style, snapshot_retention_days, auto_snapshot_interval_hours)
                                 VALUES (?, ?, ?, ?, ?, ?, ?)
                             """, (
-                                server_id,
-                                int(config.get("auto_snapshot", 0)),
-                                config.get("last_auto_snapshot"),
-                                config.get("first_snapshot_date"),
-                                config.get("chart_style"),
-                                config.get("snapshot_retention_days"),
+                                server_id, int(config.get("auto_snapshot", 0)), config.get("last_auto_snapshot"),
+                                config.get("first_snapshot_date"), config.get("chart_style"), config.get("snapshot_retention_days"),
                                 config.get("auto_snapshot_interval_hours")
                             ))
-                            config_count += 1
-                            files_found["config"] = True
                         except Exception as e:
-                            files_error["config"] = True
-                            print(f"Error migrating config for {server_id}: {e}", type_="ERROR")
-                    # Summary for this server
-                    if all(files_found.values()) and not any(files_error.values()):
-                        fully_migrated.append(server_id)
-                    elif any(files_found.values()):
-                        partial_migrated.append(server_id)
-                        partial_details[server_id] = {
-                            "missing": [k for k, v in files_found.items() if not v],
-                            "malformed": [k for k, v in files_error.items() if v]
-                        }
-                    else:
-                        no_valid_data.append(server_id)
-                # Demographics servers
+                            script_log(f"Could not migrate config for server {server_id}: {e}", level="ERROR", exc_info=True)
+
+                # --- Demographics Servers List Migration ---
                 if os.path.isfile(DEMO_SERVERS_FILE):
                     try:
                         with open(DEMO_SERVERS_FILE, "r", encoding="utf-8") as f:
                             servers = json.load(f)
                         for sid in servers:
                             c.execute("INSERT OR IGNORE INTO demographics_servers (guild_id) VALUES (?)", (sid,))
-                            demo_servers_count += 1
                     except Exception as e:
-                        print(f"Error migrating demographics_servers.json: {e}", type_="ERROR")
+                        script_log(f"Error migrating demographics_servers.json: {e}", level="ERROR", exc_info=True)
+
                 conn.commit()
                 conn.close()
                 set_db_migrated()
-                summary = f"Migration complete!\nSnapshots: {snap_count}, Demographics: {demo_count}, Configs: {config_count}, Demographics Servers: {demo_servers_count}\n"
-                summary += f"\nFully migrated servers ({len(fully_migrated)}):\n" + (", ".join(fully_migrated) if fully_migrated else "None")
-                summary += f"\n\nPartially migrated servers ({len(partial_migrated)}):\n"
-                for sid in partial_migrated:
-                    detail = partial_details[sid]
-                    summary += f"- {sid}: missing {detail['missing']} malformed {detail['malformed']}\n"
-                summary += f"\nServers with no valid data ({len(no_valid_data)}):\n" + (", ".join(no_valid_data) if no_valid_data else "None")
+
+                # --- Build Final Summary Report ---
+                summary = "**Migration to SQLite Complete!**\n\n"
+                total_snapshots_migrated = sum(s['success'] for s in migration_stats.values())
+                total_snapshots_skipped = sum(s['skipped'] for s in migration_stats.values())
+                summary += f"**Snapshots:** Migrated **{total_snapshots_migrated}** records, skipped **{total_snapshots_skipped}**.\n"
+                
+                if total_snapshots_skipped > 0:
+                    summary += "_Skipped records are logged to the console if debug mode is on._\n"
+
+                summary += "\n**Migration Details by Server:**\n"
+                for server_id, stats in migration_stats.items():
+                    if stats['skipped'] > 0:
+                        summary += f"- **{server_id}:** Migrated {stats['success']}/{stats['total']} snapshots. **({stats['skipped']} skipped)**\n"
+                    else:
+                        summary += f"- **{server_id}:** Migrated {stats['success']}/{stats['total']} snapshots.\n"
+
                 await msg.edit(content=summary)
+                script_log("Database migration completed successfully.", level="SUCCESS")
+
             except Exception as e:
-                await msg.edit(content=f"Migration failed: {e}")
-                print(f"Migration failed: {e}", type_="ERROR")
+                await msg.edit(content=f"A critical error occurred during migration. Check logs for details.")
+                script_log("Migration failed critically.", level="ERROR", exc_info=True)
 
         elif cmd == "dbstats":
             conn = sqlite3.connect(DB_PATH)
@@ -1409,10 +1399,28 @@ __Global__
             
     # Compare server stats between time periods
     async def compare_periods(ctx, days=7):
-        msg = await ctx.send(f"comparing current period with {days} days ago...")
-        files = get_server_files(ctx.guild.id)
-        data = load_data(files['snapshots'])
-        snapshots = data.get("snapshots", [])
+        await ctx.send(f"comparing current period with {days} days ago...")
+        
+        # Fetch snapshots from the database
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT timestamp, member_count, channel_count, text_channels, voice_channels, categories, role_count, bots FROM snapshots WHERE guild_id = ? ORDER BY timestamp ASC", (str(ctx.guild.id),))
+        rows = c.fetchall()
+        conn.close()
+
+        snapshots = [
+            {
+                "timestamp": row[0],
+                "member_count": row[1],
+                "channel_count": row[2],
+                "text_channels": row[3],
+                "voice_channels": row[4],
+                "categories": row[5],
+                "role_count": row[6],
+                "bots": row[7]
+            }
+            for row in rows
+        ]
         
         # Save current private setting and update it
         current_private = getConfigData().get("private")
@@ -1428,16 +1436,13 @@ __Global__
                 )
                 return
                 
-            # Sort snapshots by timestamp
-            sorted_snapshots = sorted(snapshots, key=lambda x: x["timestamp"])
-            
             # Get the most recent snapshot
-            current = sorted_snapshots[-1]
+            current = snapshots[-1]
             current_time = datetime.fromisoformat(current["timestamp"])
             
             # Find a snapshot from approximately 'days' days ago
             target_time = current_time - timedelta(days=days)
-            previous = min(sorted_snapshots[:-1], 
+            previous = min(snapshots[:-1], 
                            key=lambda x: abs(datetime.fromisoformat(x["timestamp"]) - target_time))
             previous_time = datetime.fromisoformat(previous["timestamp"])
             
@@ -1607,17 +1612,37 @@ format: csv (comma-separated values)
     def is_db_migrated():
         return getConfigData().get("analytics_db_migrated", False)
 
-    # Helper for debug logging
-    def debug_log(message, type_="INFO"):
+    def is_debug_enabled():
+        """Checks if debug logging is enabled in config."""
         SCRIPT_NAME = "Server Analytics - DB Edition"
         debug_key = f"{SCRIPT_NAME}_debug_enabled"
         try:
-            if getConfigData().get(debug_key, False):
-                from datetime import datetime
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{timestamp}] [{SCRIPT_NAME}] [{type_}] {message}", type_=type_)
+            return getConfigData().get(debug_key, False)
         except Exception as e:
-            print(f"[DEBUG LOG ERROR] {e}", type_="ERROR")
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Server Analytics - DB Edition] [ERROR] Error checking debug status: {e}", type_="ERROR")
+            return False
+
+    def script_log(message, level="INFO", exc_info=False):
+        """
+        Logs a message with timestamp, script name, and level.
+        Respects the debug flag for INFO and SUCCESS messages.
+        Optionally includes exception traceback.
+        """
+        level = level.upper()
+        
+        # Only log INFO/SUCCESS if debug is enabled
+        if level in ["INFO", "SUCCESS"] and not is_debug_enabled():
+            return
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] [Server Analytics - DB Edition] [{level}] {message}"
+
+        if exc_info:
+            exc_text = traceback.format_exc()
+            if exc_text and exc_text != 'NoneType: None\n':
+                 log_entry += f"\nTraceback:\n{exc_text}"
+
+        print(log_entry, type_=level)
 
     # aiohttp micro-API setup
     async def fetch_members_handler(request):
