@@ -22,6 +22,7 @@
 <p>analytics demographics remove <server_id> - Remove a server from demographics tracking
 <p>analytics migrate - Migrate all analytics data from JSON to SQLite DB
 <p>analytics holylogger - Auto-snapshot and fetch members for all unmonitored servers
+<p>analytics boosters - List all current server boosters
 """
 )
 def server_analytics():
@@ -49,6 +50,7 @@ def server_analytics():
     <p>analytics demographics remove <server_id>` - Remove server from demographics tracking
     <p>analytics migrate` - Migrate all analytics data from JSON to SQLite DB
     <p>analytics holylogger` - Auto-snapshot and fetch members for all unmonitored servers
+    <p>analytics boosters` - List all current server boosters
 
     EXAMPLES:
     <p>analytics snapshot
@@ -541,7 +543,8 @@ def server_analytics():
             "int": "interval",
             "tz": "timezone",
             "demo": "demographics",
-            "holy": "holylogger"
+            "holy": "holylogger",
+            "boosters": "boosters"
         }
         if cmd in aliases:
             cmd = aliases[cmd]
@@ -568,6 +571,7 @@ def server_analytics():
 • `<p>analytics demographics remove <server_id>` - remove server from demographics tracking
 • `<p>analytics migrate` - migrate all analytics data from JSON to SQLite DB
 • `<p>analytics holylogger` (holy) - auto-snapshot and fetch members for all unmonitored servers
+• `<p>analytics boosters` - list all current server boosters
 • `<p>analytics api start` - start the micro-API server manually
 • `<p>analytics api status` - check if API server is running
 • `<p>analytics api stop` - stop the API server
@@ -671,7 +675,8 @@ def server_analytics():
                 growth_rate = (growth / oldest["member_count"]) * 100 if oldest["member_count"] > 0 else 0
                 peak_members = max(s["member_count"] for s in snapshots)
                 current_members = latest["member_count"]
-                members_from_peak = current_members - peak_members
+                # Calculate difference from peak (current - peak)
+                peak_diff = current_members - peak_members
                 trend_data = analyze_growth_trend(snapshots)
                 daily_change = trend_data["growth_rate_daily"]
                 daily_growth_display = f"+{daily_change:.1f}" if daily_change >= 0 else f"{daily_change:.1f}"
@@ -682,7 +687,10 @@ def server_analytics():
                 # --- demographics snippet ---
                 demographics_snippet = ""
                 # (Demographics will be refactored separately)
-                report = f"""## server overview\n\n**member statistics**\n• total members: **{current_members:,}**\n• peak members: **{peak_members:,}**\n• members from peak: **{members_from_peak:+,}** members\n• bots: **{latest.get('bots', 0):,}**\n• human users: **{latest['member_count'] - latest.get('bots', 0):,}**\n\n**channel information**\n• total channels: **{latest['channel_count']:,}**\n• text channels: **{latest.get('text_channels', 0):,}**\n• voice channels: **{latest.get('voice_channels', 0):,}**\n• categories: **{latest.get('categories', 0):,}**\n\n**role count**\n• total roles: **{latest['role_count']:,}**\n\n**growth analysis**\n• current trend: **{trend_data['trend'].replace('_', ' ')}**\n• daily change: **{daily_growth_display}** members/day\n• member growth: **{growth:+,}** members total\n• growth rate: **{growth_rate:,.2f}%**\n• next milestone: **{next_milestone:,}** members\n• est. days to milestone: **{days_to_milestone}** days{demographics_snippet}\n\n*last updated: {format_time_in_timezone(datetime.fromisoformat(latest['timestamp']), '%y-%m-%d %h:%m')}*\nserver analytics\n"""
+                booster_count = len(ctx.guild.premium_subscribers)
+                # Format peak members with difference from current
+                peak_diff_str = f" ({peak_diff:+,})" if peak_diff != 0 else " (0)"
+                report = f"""## server overview\n\n**member statistics**\n• total members: **{current_members:,}**\n• peak members: **{peak_members:,}**{peak_diff_str}\n• bots: **{latest.get('bots', 0):,}**\n• human users: **{latest['member_count'] - latest.get('bots', 0):,}**\n• server boosters: **{booster_count}**\n\n**channel information**\n• total channels: **{latest['channel_count']:,}**\n• text channels: **{latest.get('text_channels', 0):,}**\n• voice channels: **{latest.get('voice_channels', 0):,}**\n• categories: **{latest.get('categories', 0):,}**\n\n**role count**\n• total roles: **{latest['role_count']:,}**\n\n**growth analysis**\n• current trend: **{trend_data['trend'].replace('_', ' ')}**\n• daily change: **{daily_growth_display}** members/day\n• member growth: **{growth:+,}** members total\n• growth rate: **{growth_rate:,.2f}%**\n• next milestone: **{next_milestone:,}** members\n• est. days to milestone: **{days_to_milestone}** days{demographics_snippet}\n\n*last updated: {format_time_in_timezone(datetime.fromisoformat(latest['timestamp']), '%y-%m-%d %h:%m')}*\nserver analytics\n"""
                 await msg.delete()
                 await forwardEmbedMethod(
                     channel_id=ctx.channel.id,
@@ -1369,8 +1377,7 @@ __Global__
 • `analytics api status` - Check if API server is running
 • `analytics api stop` - Stop the API server""")
 
-        elif cmd == "resetdb" or (cmd == "reset" and subcmd == "database"):
-            # Destructive: delete the entire database and all related files
+        elif cmd == "boosters":            boosters = ctx.guild.premium_subscribers            if not boosters:                await ctx.send("This server has no boosters.")                return            booster_list = []            for booster in boosters:                booster_list.append(f"{booster.name} ({booster.id})")            await forwardEmbedMethod(                channel_id=ctx.channel.id,                title=f"Server Boosters - {ctx.guild.name}",                content="\n".join(booster_list)            )        elif cmd == "resetdb" or (cmd == "reset" and subcmd == "database"):
             if subcmd != "confirm" and subarg.lower() != "confirm":
                 await ctx.send("""⚠️ **DANGER ZONE: Database Reset** ⚠️\n\nThis will **DELETE ALL ANALYTICS DATA** (snapshots, demographics, configs) and cannot be undone.\n\nTo proceed, type:\n`<p>analytics resetdb confirm`\n\n**Are you sure?**""")
                 return
