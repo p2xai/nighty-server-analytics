@@ -14,20 +14,23 @@
    git clone https://github.com/p2xai/nighty-server-analytics.git
    cd nighty-server-analytics/server_analytics
    ```
-2. **Install dependencies:**
+2. **Copy/Drag `server analytics.py` to your Nighty /scripts folder**
+   ```sh
+   %appdata%\Nighty Selfbot\data\scripts
+3. **Install dependencies:**
    ```sh
    pip install flask requests
    ```
-3. **Toggle the analytics script in Nighty**
+4. **Toggle the analytics script in Nighty**
    ```sh
    # In Discord run:
    <p>analytics api start
    ```
-4. **Start the dashboard:**
+5. **Start the dashboard:**
    ```sh
    python analytics_dashboard.py
    ```
-5. **Open your browser:**
+6. **Open your browser:**
    - Go to [http://127.0.0.1:5000/](http://127.0.0.1:5000/)
 
 ---
@@ -42,6 +45,7 @@ server_analytics/
   analytics_test.db (auto-created)
   server_member_tracking/ (auto-created)
 ```
+> **Note:** The database and server_member_tracking folder are auto-created in your Nighty directory (where Nighty stores its data/scripts).
 
 ---
 
@@ -94,15 +98,6 @@ server_analytics/
 - Add new analytics or export features by editing `server_analytics.py`
 - Customize dashboard UI/UX in `analytics_dashboard.py` (HTML/JS is inline)
 - Add new API endpoints as needed for automation or integration
-
----
-
-## Troubleshooting
-
-- **404 or 'Unexpected token <' errors:** Ensure all API endpoints are present and not commented out
-- **Database errors:** Check that `analytics_test.db` is writable and not corrupted
-- **Bot permissions:** The analytics engine must have permission to read members and channels
-- **Webhooks:** Configure via `/analytics-config` for logging
 
 ---
 
