@@ -96,7 +96,7 @@ def server_analytics():
     
     # API configuration
     API_TOKEN = os.environ.get('NIGHTY_API_TOKEN', 'default_token_change_me')
-    API_HOST = '127.0.0.1'
+    API_HOST = '0.0.0.0'  # Bind to all interfaces to allow external access
     API_PORT = 5500
     
     # Timezone offsets (in hours from UTC)
@@ -1788,6 +1788,67 @@ format: csv (comma-separated values)
             print(f"[WebAPI] Error in fetch_members_handler: {e}", type_="ERROR")
             return web.json_response({'error': 'Internal server error'}, status=500)
 
+    async def take_snapshot_handler(request):
+        """Handle POST /take_snapshot requests"""
+        try:
+            # Verify token
+            auth_header = request.headers.get('Authorization')
+            if not auth_header or auth_header != f'Bearer {API_TOKEN}':
+                print(f"[WebAPI] Unauthorized request: {auth_header}", type_="ERROR")
+                return web.json_response({'error': 'Unauthorized'}, status=401)
+            
+            # Parse request body
+            data = await request.json()
+            guild_id = data.get('guild_id')
+            token = data.get('token')
+            manual = data.get('manual', False)
+            print(f"[WebAPI] take_snapshot_handler called with guild_id={guild_id}, manual={manual}", type_="INFO")
+            
+            if not guild_id or not token or token != API_TOKEN:
+                print(f"[WebAPI] Invalid request data: guild_id={guild_id}, token={token}", type_="ERROR")
+                return web.json_response({'error': 'Invalid request data'}, status=400)
+            
+            # Find the guild
+            guild = bot.get_guild(int(guild_id))
+            if not guild:
+                print(f"[WebAPI] Guild not found or not accessible: {guild_id}", type_="ERROR")
+                return web.json_response({'error': 'Guild not found or not accessible'}, status=404)
+            
+            # Take the snapshot
+            try:
+                await take_snapshot(guild, is_auto=not manual)
+                
+                # Get the latest snapshot data
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                latest_snapshot = c.execute(
+                    "SELECT member_count FROM snapshots WHERE guild_id = ? ORDER BY timestamp DESC LIMIT 1",
+                    (str(guild.id),)
+                ).fetchone()
+                conn.close()
+                
+                member_count = latest_snapshot[0] if latest_snapshot else 0
+                
+                print(f"[WebAPI] Successfully took snapshot for {guild.name} with {member_count} members", type_="INFO")
+                
+                return web.json_response({
+                    'success': True,
+                    'guild_name': guild.name,
+                    'member_count': member_count,
+                    'message': f'Successfully took snapshot for {guild.name}',
+                    'manual': manual
+                })
+                
+            except Exception as snapshot_error:
+                print(f"[WebAPI] Failed to take snapshot for {guild.name}: {snapshot_error}", type_="ERROR")
+                return web.json_response({
+                    'error': f'Failed to take snapshot: {str(snapshot_error)}'
+                }, status=500)
+                
+        except Exception as e:
+            print(f"[WebAPI] Error in take_snapshot_handler: {e}", type_="ERROR")
+            return web.json_response({'error': 'Internal server error'}, status=500)
+
     async def health_check_handler(request):
         """Handle GET /health requests for testing"""
         return web.json_response({
@@ -1803,6 +1864,7 @@ format: csv (comma-separated values)
             
             app = web.Application()
             app.router.add_post('/fetch_members', fetch_members_handler)
+            app.router.add_post('/take_snapshot', take_snapshot_handler)
             app.router.add_get('/health', health_check_handler)
             
             runner = web.AppRunner(app)
@@ -1814,6 +1876,7 @@ format: csv (comma-separated values)
             print(f"[WebAPI] Available endpoints:", type_="INFO")
             print(f"[WebAPI]   GET  /health - Health check", type_="INFO")
             print(f"[WebAPI]   POST /fetch_members - Fetch members", type_="INFO")
+            print(f"[WebAPI]   POST /take_snapshot - Take snapshot", type_="INFO")
             return runner
             
         except Exception as e:
