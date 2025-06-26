@@ -20,46 +20,64 @@ def get_db():
     return conn
 
 def init_database():
-    """Initialize database schema if it doesn't exist"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        # Create snapshots table if it doesn't exist
-        c.execute('''CREATE TABLE IF NOT EXISTS snapshots (
+    """Initialize the database with the required schema"""
+    db = get_db()
+    
+    # Create server_config table
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS server_config (
+            guild_id TEXT PRIMARY KEY,
+            guild_name TEXT,
+            auto_snapshot BOOLEAN DEFAULT 0,
+            last_auto_snapshot TEXT,
+            last_snapshot TEXT,
+            first_snapshot_date TEXT,
+            chart_style TEXT DEFAULT 'emoji',
+            snapshot_retention_days INTEGER DEFAULT 90,
+            auto_snapshot_interval_hours INTEGER DEFAULT 20
+        )
+    ''')
+    
+    # Create snapshots table
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id TEXT NOT NULL,
             guild_name TEXT,
-            member_count INTEGER NOT NULL,
-            timestamp TEXT NOT NULL
-        )''')
-        
-        # Create demographics table if it doesn't exist
-        c.execute('''CREATE TABLE IF NOT EXISTS demographics (
-            guild_id TEXT,
-            member_id TEXT,
+            timestamp TEXT NOT NULL,
+            member_count INTEGER,
+            channel_count INTEGER,
+            text_channels INTEGER,
+            voice_channels INTEGER,
+            categories INTEGER,
+            role_count INTEGER,
+            bots INTEGER,
+            is_auto BOOLEAN DEFAULT 0,
+            FOREIGN KEY (guild_id) REFERENCES server_config (guild_id)
+        )
+    ''')
+    
+    # Create demographics table
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS demographics (
+            guild_id TEXT NOT NULL,
+            member_id TEXT NOT NULL,
             name TEXT,
             account_created TEXT,
             joined_at TEXT,
-            PRIMARY KEY (guild_id, member_id)
-        )''')
-        
-        # Create server_config table if it doesn't exist
-        c.execute('''CREATE TABLE IF NOT EXISTS server_config (
-            guild_id TEXT PRIMARY KEY,
-            auto_snapshot INTEGER,
-            last_auto_snapshot TEXT,
-            first_snapshot_date TEXT,
-            chart_style TEXT,
-            snapshot_retention_days INTEGER,
-            auto_snapshot_interval_hours REAL
-        )''')
-        
-        conn.commit()
-        conn.close()
-        print(f"Database schema initialized at {DB_PATH}")
-    except Exception as e:
-        print(f"Error initializing database: {e}")
+            PRIMARY KEY (guild_id, member_id),
+            FOREIGN KEY (guild_id) REFERENCES server_config (guild_id)
+        )
+    ''')
+    
+    # Add last_snapshot column if it doesn't exist
+    try:
+        db.execute('ALTER TABLE server_config ADD COLUMN last_snapshot TEXT')
+    except:
+        pass  # Column already exists
+    
+    db.commit()
+    print(f"Database schema initialized at {DB_PATH}")
 
 def get_global_webhook_url():
     # For now, use a global webhook config file (can be per-server later)
@@ -1213,7 +1231,7 @@ def config_page():
                             <th>Interval (hours)</th>
                             <th>Retention (days)</th>
                             <th>First Snapshot</th>
-                            <th>Last Auto Snapshot</th>
+                            <th>Last Snapshot</th>
                             <th>Actions</th>
                         </tr>
                     </thead>
@@ -1282,6 +1300,25 @@ def config_page():
                 return tsStr;
             }
             
+            function formatTimeSince(ts) {
+                if (!ts) return 'Never';
+                const tsStr = String(ts);
+                const timestamp = new Date(tsStr);
+                const now = new Date();
+                const diffMs = now - timestamp;
+                const diffMins = Math.floor(diffMs / (1000 * 60));
+                const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+                const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+                
+                if (diffMins < 1) return 'Just now';
+                if (diffMins < 60) return `${diffMins}m ago`;
+                if (diffHours < 24) return `${diffHours}h ago`;
+                if (diffDays < 7) return `${diffDays}d ago`;
+                
+                // For longer periods, show the actual date
+                return formatTimestamp(ts);
+            }
+            
             async function loadConfigs() {
                 try {
                     const res = await fetch('/api/server_configs');
@@ -1336,7 +1373,7 @@ def config_page():
                                    onchange="updateConfig('${config.guild_id}', 'snapshot_retention_days', this.value)">
                         </td>
                         <td>${formatTimestamp(config.first_snapshot_date)}</td>
-                        <td>${formatTimestamp(config.last_auto_snapshot)}</td>
+                        <td>${formatTimeSince(config.last_snapshot)}</td>
                         <td>
                             <button class="snapshot-btn" onclick="takeSnapshot('${config.guild_id}')">Take Snapshot</button>
                             <br><br>
@@ -1465,6 +1502,44 @@ def config_page():
                 } catch (e) {
                     console.error('Fetch members error:', e);
                     showNotification(`Failed to fetch members: ${e.message}`, true);
+                } finally {
+                    // Restore button state
+                    button.textContent = originalText;
+                    button.disabled = false;
+                    button.classList.remove('loading');
+                }
+            }
+            
+            async function testAutoSnapshot(guildId) {
+                const button = document.querySelector(`tr[data-guild-id="${guildId}"] .snapshot-btn[onclick*="testAutoSnapshot"]`);
+                const originalText = button.textContent;
+                
+                // Show loading state
+                button.textContent = 'Testing...';
+                button.disabled = true;
+                button.classList.add('loading');
+                
+                try {
+                    const res = await fetch('/api/test_auto_snapshot/' + guildId, {
+                        method: 'POST'
+                    });
+                    
+                    if (!res.ok) {
+                        const errorData = await res.json();
+                        throw new Error(errorData.error || 'Failed to test auto snapshot');
+                    }
+                    
+                    const data = await res.json();
+                    
+                    if (data.success) {
+                        showNotification(`Test auto snapshot notification sent successfully! Check your webhook.`, false);
+                    } else {
+                        throw new Error(data.error || 'Unknown error occurred');
+                    }
+                    
+                } catch (e) {
+                    console.error('Test auto snapshot error:', e);
+                    showNotification(`Failed to test auto snapshot: ${e.message}`, true);
                 } finally {
                     // Restore button state
                     button.textContent = originalText;
@@ -1756,7 +1831,8 @@ def trigger_fetch_members(guild_id):
                 "title": "Fetched Members",
                 "description": f"Fetched members for {guild_name} at {timestamp}",
                 "fields": [
-                    {"name": "Member Count", "value": str(member_count), "inline": True}
+                    {"name": "Member Count", "value": str(member_count), "inline": True},
+                    {"name": "Server ID", "value": str(guild_id), "inline": True}
                 ],
                 "color": 0x90caf9
             }
@@ -2495,10 +2571,22 @@ def get_server_configs():
             WHERE first_snapshot_date IS NOT NULL
             ORDER BY guild_id
         ''').fetchall()
+        
+        # Get the most recent snapshot for each server
+        latest_snapshots = db.execute('''
+            SELECT guild_id, MAX(timestamp) as last_snapshot
+            FROM snapshots 
+            GROUP BY guild_id
+        ''').fetchall()
+        
+        # Create a lookup for latest snapshots
+        latest_snapshot_lookup = {row['guild_id']: row['last_snapshot'] for row in latest_snapshots}
+        
         # Get server names
         server_names = {}
         for row in db.execute('SELECT guild_id, guild_name FROM snapshots WHERE guild_name IS NOT NULL GROUP BY guild_id').fetchall():
             server_names[row['guild_id']] = row['guild_name']
+        
         result = []
         for row in configs:
             result.append({
@@ -2506,6 +2594,7 @@ def get_server_configs():
                 'guild_name': server_names.get(row['guild_id'], f"Server {row['guild_id']}"),
                 'auto_snapshot': bool(row['auto_snapshot']),
                 'last_auto_snapshot': row['last_auto_snapshot'],
+                'last_snapshot': latest_snapshot_lookup.get(row['guild_id']),
                 'first_snapshot_date': row['first_snapshot_date'],
                 'snapshot_retention_days': row['snapshot_retention_days'],
                 'auto_snapshot_interval_hours': row['auto_snapshot_interval_hours']
@@ -2560,7 +2649,8 @@ def update_server_config():
             "description": f"Updated {field_name} for server {guild_id}",
             "fields": [
                 {"name": "Field", "value": field_name, "inline": True},
-                {"name": "Value", "value": str(value), "inline": True}
+                {"name": "Value", "value": str(value), "inline": True},
+                {"name": "Server ID", "value": str(guild_id), "inline": True}
             ],
             "color": 0x90caf9
         }
@@ -2618,8 +2708,8 @@ def take_manual_snapshot(guild_id):
             db = get_db()
             now = datetime.now(timezone.utc)
             db.execute(
-                'UPDATE server_config SET last_auto_snapshot = ? WHERE guild_id = ?',
-                (now.isoformat(), guild_id)
+                'UPDATE server_config SET last_auto_snapshot = ?, last_snapshot = ? WHERE guild_id = ?',
+                (now.isoformat(), now.isoformat(), guild_id)
             )
             db.commit()
             
@@ -2633,7 +2723,8 @@ def take_manual_snapshot(guild_id):
                 "description": f"Manual snapshot taken for {guild_name} at {timestamp}",
                 "fields": [
                     {"name": "Member Count", "value": str(member_count), "inline": True},
-                    {"name": "Type", "value": "Manual", "inline": True}
+                    {"name": "Type", "value": "Manual", "inline": True},
+                    {"name": "Server ID", "value": str(guild_id), "inline": True}
                 ],
                 "color": 0x4caf50
             }
@@ -2670,6 +2761,113 @@ def take_manual_snapshot(guild_id):
         }), 504
     except Exception as e:
         print(f"[Analytics] Unexpected error in take_manual_snapshot: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/auto_snapshot_notification', methods=['POST'])
+def receive_auto_snapshot_notification():
+    """Receive auto snapshot notifications from the NightyScript micro-API"""
+    try:
+        # Verify the request is from the micro-API
+        auth_header = request.headers.get('Authorization')
+        api_token = os.environ.get('NIGHTY_API_TOKEN', 'default_token_change_me')
+        
+        if not auth_header or auth_header != f'Bearer {api_token}':
+            return jsonify({'error': 'Unauthorized'}), 401
+        
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        guild_id = data.get('guild_id')
+        guild_name = data.get('guild_name', f'Server {guild_id}')
+        member_count = data.get('member_count', 0)
+        timestamp = data.get('timestamp')
+        is_auto = data.get('is_auto', True)
+        
+        if not guild_id:
+            return jsonify({'error': 'Missing guild_id'}), 400
+        
+        # Update last_auto_snapshot in database if this was an auto snapshot
+        if is_auto:
+            db = get_db()
+            db.execute(
+                'UPDATE server_config SET last_auto_snapshot = ?, last_snapshot = ? WHERE guild_id = ?',
+                (timestamp, timestamp, guild_id)
+            )
+            db.commit()
+        
+        # Format timestamp for display
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                # Format to match other webhook messages: "2025-06-26 22:28:14 UTC"
+                display_time = dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+            except:
+                display_time = timestamp
+        else:
+            display_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        
+        # Webhook log
+        snapshot_type = "Auto" if is_auto else "Manual"
+        color = 0x2196f3 if is_auto else 0x4caf50  # Blue for auto, green for manual
+        
+        embed = {
+            "title": f"{snapshot_type} Snapshot Taken",
+            "description": f"{snapshot_type.lower().capitalize()} snapshot taken for {guild_name} at {display_time}",
+            "fields": [
+                {"name": "Member Count", "value": str(member_count), "inline": True},
+                {"name": "Type", "value": snapshot_type, "inline": True},
+                {"name": "Server ID", "value": str(guild_id), "inline": True}
+            ],
+            "color": color
+        }
+        send_webhook_log("", embed=embed)
+        
+        print(f"[Analytics] Received {snapshot_type.lower()} snapshot notification for {guild_name} ({guild_id})")
+        
+        return jsonify({'success': True, 'message': f'{snapshot_type} snapshot logged successfully'})
+        
+    except Exception as e:
+        print(f"[Analytics] Error in auto_snapshot_notification: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/test_auto_snapshot/<guild_id>', methods=['POST'])
+def test_auto_snapshot(guild_id):
+    """Test endpoint to simulate an auto snapshot notification"""
+    try:
+        from datetime import datetime, timezone
+        
+        # Create a test auto snapshot notification
+        test_data = {
+            'guild_id': str(guild_id),
+            'guild_name': f'Test Server {guild_id}',
+            'member_count': 1234,  # Test member count
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'is_auto': True
+        }
+        
+        # Send the notification to our own endpoint
+        response = requests.post(
+            f'http://127.0.0.1:5000/api/auto_snapshot_notification',
+            headers={'Authorization': f'Bearer {os.environ.get("NIGHTY_API_TOKEN", "default_token_change_me")}'},
+            json=test_data,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            return jsonify({
+                'success': True,
+                'message': 'Test auto snapshot notification sent successfully',
+                'test_data': test_data
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': f'Failed to send test notification: {response.text}'
+            }), response.status_code
+            
+    except Exception as e:
+        print(f"[Analytics] Error in test_auto_snapshot: {e}")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
