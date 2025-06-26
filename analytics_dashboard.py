@@ -1,20 +1,65 @@
 from flask import Flask, jsonify, render_template_string, request
 import sqlite3
 import os
+import json
 from datetime import datetime, timezone
 from collections import defaultdict
-import json
 import requests
 
 app = Flask(__name__)
 DB_PATH = os.path.join(os.path.dirname(__file__), "json", "analytics_test.db")
 
-WEBHOOK_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'server_member_tracking', 'global_analytics_webhook.json')
+# Configuration for NightyScript micro-API
+NIGHTY_API_BASE_URL = os.environ.get('NIGHTY_API_BASE_URL', 'http://127.0.0.1:5500')
+
+WEBHOOK_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'json', 'global_analytics_webhook.json')
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+def init_database():
+    """Initialize database schema if it doesn't exist"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        # Create snapshots table if it doesn't exist
+        c.execute('''CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id TEXT NOT NULL,
+            guild_name TEXT,
+            member_count INTEGER NOT NULL,
+            timestamp TEXT NOT NULL
+        )''')
+        
+        # Create demographics table if it doesn't exist
+        c.execute('''CREATE TABLE IF NOT EXISTS demographics (
+            guild_id TEXT,
+            member_id TEXT,
+            name TEXT,
+            account_created TEXT,
+            joined_at TEXT,
+            PRIMARY KEY (guild_id, member_id)
+        )''')
+        
+        # Create server_config table if it doesn't exist
+        c.execute('''CREATE TABLE IF NOT EXISTS server_config (
+            guild_id TEXT PRIMARY KEY,
+            auto_snapshot INTEGER,
+            last_auto_snapshot TEXT,
+            first_snapshot_date TEXT,
+            chart_style TEXT,
+            snapshot_retention_days INTEGER,
+            auto_snapshot_interval_hours REAL
+        )''')
+        
+        conn.commit()
+        conn.close()
+        print(f"Database schema initialized at {DB_PATH}")
+    except Exception as e:
+        print(f"Error initializing database: {e}")
 
 def get_global_webhook_url():
     # For now, use a global webhook config file (can be per-server later)
@@ -1683,7 +1728,7 @@ def trigger_fetch_members(guild_id):
         # Get the API token from environment variable
         api_token = os.environ.get('NIGHTY_API_TOKEN', 'default_token_change_me')
         # Prepare the request to the NightyScript micro-API
-        api_url = f'http://127.0.0.1:5500/fetch_members'
+        api_url = f'{NIGHTY_API_BASE_URL}/fetch_members'
         headers = {
             'Authorization': f'Bearer {api_token}',
             'Content-Type': 'application/json'
@@ -2470,5 +2515,164 @@ def get_server_configs():
         print(f"Error in get_server_configs: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/update_config', methods=['POST'])
+def update_server_config():
+    """Update server configuration settings"""
+    try:
+        data = request.get_json()
+        guild_id = data.get('guild_id')
+        field = data.get('field')
+        value = data.get('value')
+        
+        if not guild_id or not field:
+            return jsonify({'error': 'Missing guild_id or field'}), 400
+        
+        db = get_db()
+        
+        # Validate field name to prevent SQL injection
+        allowed_fields = {
+            'auto_snapshot', 'auto_snapshot_interval_hours', 
+            'snapshot_retention_days', 'chart_style'
+        }
+        
+        if field not in allowed_fields:
+            return jsonify({'error': f'Invalid field: {field}'}), 400
+        
+        # Convert boolean for auto_snapshot
+        if field == 'auto_snapshot':
+            value = 1 if value else 0
+        elif field in ['auto_snapshot_interval_hours', 'snapshot_retention_days']:
+            try:
+                value = int(value)
+                if value <= 0:
+                    return jsonify({'error': f'{field} must be positive'}), 400
+            except (ValueError, TypeError):
+                return jsonify({'error': f'{field} must be a number'}), 400
+        
+        # Update the configuration
+        db.execute(f'UPDATE server_config SET {field} = ? WHERE guild_id = ?', (value, guild_id))
+        db.commit()
+        
+        # Log the update via webhook
+        field_name = field.replace('_', ' ').title()
+        embed = {
+            "title": "Configuration Updated",
+            "description": f"Updated {field_name} for server {guild_id}",
+            "fields": [
+                {"name": "Field", "value": field_name, "inline": True},
+                {"name": "Value", "value": str(value), "inline": True}
+            ],
+            "color": 0x90caf9
+        }
+        send_webhook_log("", embed=embed)
+        
+        return jsonify({'success': True})
+        
+    except Exception as e:
+        print(f"Error updating config: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/take_snapshot/<guild_id>', methods=['POST'])
+def take_manual_snapshot(guild_id):
+    """Take a manual snapshot for a specific server"""
+    try:
+        import requests
+        import os
+        from datetime import datetime, timezone
+        
+        # Get the API token from environment variable
+        api_token = os.environ.get('NIGHTY_API_TOKEN', 'default_token_change_me')
+        
+        # Prepare the request to the NightyScript micro-API
+        api_url = f'{NIGHTY_API_BASE_URL}/take_snapshot'
+        headers = {
+            'Authorization': f'Bearer {api_token}',
+            'Content-Type': 'application/json'
+        }
+        data = {
+            'guild_id': str(guild_id),
+            'token': api_token,
+            'manual': True
+        }
+        
+        print(f"[Analytics] Making request to {api_url} for guild {guild_id}")
+        
+        # Make the request to the NightyScript micro-API
+        response = requests.post(api_url, headers=headers, json=data, timeout=30)
+        
+        print(f"[Analytics] Response status: {response.status_code}")
+        print(f"[Analytics] Response content: {response.text[:200]}...")  # First 200 chars
+        
+        if response.status_code == 200:
+            try:
+                result = response.json()
+            except json.JSONDecodeError as e:
+                print(f"[Analytics] JSON decode error: {e}")
+                print(f"[Analytics] Full response content: {response.text}")
+                return jsonify({
+                    'success': False,
+                    'error': f'Invalid JSON response from micro-API: {response.text[:100]}'
+                }), 500
+            
+            # Update last_auto_snapshot in database
+            db = get_db()
+            now = datetime.now(timezone.utc)
+            db.execute(
+                'UPDATE server_config SET last_auto_snapshot = ? WHERE guild_id = ?',
+                (now.isoformat(), guild_id)
+            )
+            db.commit()
+            
+            # Webhook log on success
+            guild_name = result.get('guild_name', f'Server {guild_id}')
+            member_count = result.get('member_count', 0)
+            timestamp = now.strftime('%Y-%m-%d %H:%M:%S UTC')
+            
+            embed = {
+                "title": "Manual Snapshot Taken",
+                "description": f"Manual snapshot taken for {guild_name} at {timestamp}",
+                "fields": [
+                    {"name": "Member Count", "value": str(member_count), "inline": True},
+                    {"name": "Type", "value": "Manual", "inline": True}
+                ],
+                "color": 0x4caf50
+            }
+            send_webhook_log("", embed=embed)
+            
+            return jsonify({
+                'success': True,
+                'message': f'Snapshot taken successfully for server {guild_id}',
+                'member_count': member_count,
+                'guild_name': guild_name
+            })
+        else:
+            # Try to parse error response as JSON, but handle non-JSON responses
+            try:
+                error_data = response.json()
+                error_message = error_data.get('error', f'HTTP {response.status_code}')
+            except json.JSONDecodeError:
+                error_message = f'HTTP {response.status_code}: {response.text[:100]}'
+            
+            return jsonify({
+                'success': False,
+                'error': error_message
+            }), response.status_code
+            
+    except requests.exceptions.ConnectionError:
+        return jsonify({
+            'success': False,
+            'error': 'Cannot connect to NightyScript micro-API. Make sure the NightyScript is running.'
+        }), 503
+    except requests.exceptions.Timeout:
+        return jsonify({
+            'success': False,
+            'error': 'Request to NightyScript micro-API timed out.'
+        }), 504
+    except Exception as e:
+        print(f"[Analytics] Unexpected error in take_manual_snapshot: {e}")
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
+    # Initialize database schema
+    init_database()
     app.run(debug=True)
