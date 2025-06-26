@@ -99,6 +99,9 @@ def server_analytics():
     API_HOST = '0.0.0.0'  # Bind to all interfaces to allow external access
     API_PORT = 5500
     
+    # Analytics dashboard configuration
+    ANALYTICS_DASHBOARD_URL = os.environ.get('ANALYTICS_DASHBOARD_URL', 'http://127.0.0.1:5000')
+    
     # Timezone offsets (in hours from UTC)
     TIMEZONE_OFFSETS = {
     "UTC": 0,
@@ -431,8 +434,16 @@ def server_analytics():
             
         # Take the snapshot silently
         try:
-            await take_snapshot(message.guild, is_auto=True)
+            snapshot_data = await take_snapshot(message.guild, is_auto=True)
             print(f"Auto-snapshot taken for {message.guild.name} (ID: {message.guild.id})", type_="INFO")
+            
+            # Send notification to analytics dashboard
+            await send_analytics_notification(
+                message.guild.id, 
+                message.guild.name, 
+                snapshot_data["member_count"], 
+                is_auto=True
+            )
         except Exception as e:
             print(f"Error taking auto-snapshot: {str(e)}", type_="ERROR")
 
@@ -1831,6 +1842,9 @@ format: csv (comma-separated values)
                 
                 print(f"[WebAPI] Successfully took snapshot for {guild.name} with {member_count} members", type_="INFO")
                 
+                # Send notification to analytics dashboard
+                await send_analytics_notification(guild.id, guild.name, member_count, is_auto=not manual)
+                
                 return web.json_response({
                     'success': True,
                     'guild_name': guild.name,
@@ -1896,5 +1910,35 @@ format: csv (comma-separated values)
         except Exception as e:
             print(f"[WebAPI] Failed to start API server: {e}", type_="ERROR")
             print(f"[WebAPI] Error details: {type(e).__name__}: {str(e)}", type_="ERROR")
+
+    async def send_analytics_notification(guild_id, guild_name, member_count, is_auto=True):
+        """Send notification to analytics dashboard about snapshot taken"""
+        try:
+            notification_data = {
+                'guild_id': str(guild_id),
+                'guild_name': guild_name,
+                'member_count': member_count,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'is_auto': is_auto
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f'{ANALYTICS_DASHBOARD_URL}/api/auto_snapshot_notification',
+                    headers={
+                        'Authorization': f'Bearer {API_TOKEN}',
+                        'Content-Type': 'application/json'
+                    },
+                    json=notification_data,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status == 200:
+                        print(f"[WebAPI] Successfully sent {('auto' if is_auto else 'manual')} snapshot notification to analytics dashboard for {guild_name}", type_="INFO")
+                    else:
+                        print(f"[WebAPI] Failed to send notification to analytics dashboard: HTTP {response.status}", type_="WARNING")
+                        
+        except Exception as e:
+            print(f"[WebAPI] Error sending notification to analytics dashboard: {e}", type_="WARNING")
+            # Don't fail the snapshot if notification fails
 
 server_analytics()  # Initialize the script
