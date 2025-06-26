@@ -1377,7 +1377,20 @@ __Global__
 • `analytics api status` - Check if API server is running
 • `analytics api stop` - Stop the API server""")
 
-        elif cmd == "boosters":            boosters = ctx.guild.premium_subscribers            if not boosters:                await ctx.send("This server has no boosters.")                return            booster_list = []            for booster in boosters:                booster_list.append(f"{booster.name} ({booster.id})")            await forwardEmbedMethod(                channel_id=ctx.channel.id,                title=f"Server Boosters - {ctx.guild.name}",                content="\n".join(booster_list)            )        elif cmd == "resetdb" or (cmd == "reset" and subcmd == "database"):
+        elif cmd == "boosters":
+            boosters = ctx.guild.premium_subscribers
+            if not boosters:
+                await ctx.send("This server has no boosters.")
+                return
+            booster_list = []
+            for booster in boosters:
+                booster_list.append(f"{booster.name} ({booster.id})")
+            await forwardEmbedMethod(
+                channel_id=ctx.channel.id,
+                title=f"Server Boosters - {ctx.guild.name}",
+                content="\n".join(booster_list)
+            )
+        elif cmd == "resetdb" or (cmd == "reset" and subcmd == "database"):
             if subcmd != "confirm" and subarg.lower() != "confirm":
                 await ctx.send("""⚠️ **DANGER ZONE: Database Reset** ⚠️\n\nThis will **DELETE ALL ANALYTICS DATA** (snapshots, demographics, configs) and cannot be undone.\n\nTo proceed, type:\n`<p>analytics resetdb confirm`\n\n**Are you sure?**""")
                 return
