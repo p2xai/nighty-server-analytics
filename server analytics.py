@@ -358,8 +358,8 @@ def server_analytics():
             int(is_auto)
         ))
         
-        # Get current auto_snapshot setting to preserve it
-        c.execute("SELECT auto_snapshot, chart_style, snapshot_retention_days, auto_snapshot_interval_hours FROM server_config WHERE guild_id = ?", (str(guild.id),))
+        # Get current config, including first_snapshot_date
+        c.execute("SELECT auto_snapshot, chart_style, snapshot_retention_days, auto_snapshot_interval_hours, first_snapshot_date FROM server_config WHERE guild_id = ?", (str(guild.id),))
         config_row = c.fetchone()
         
         if config_row:
@@ -367,13 +367,18 @@ def server_analytics():
             current_chart_style = config_row[1] if config_row[1] else "emoji"
             current_retention_days = config_row[2] if config_row[2] else DATA_RETENTION_DAYS
             current_interval_hours = config_row[3] if config_row[3] else DEFAULT_AUTO_SNAPSHOT_INTERVAL_HOURS
+            current_first_snapshot_date = config_row[4]
         else:
             current_auto_snapshot = 0
             current_chart_style = "emoji"
             current_retention_days = DATA_RETENTION_DAYS
             current_interval_hours = DEFAULT_AUTO_SNAPSHOT_INTERVAL_HOURS
+            current_first_snapshot_date = None
         
-        # Update or create server config - preserve existing auto_snapshot setting
+        # Only set first_snapshot_date if not already set
+        first_snapshot_date_to_set = current_first_snapshot_date or timestamp.isoformat()
+        
+        # Update or create server config - preserve existing auto_snapshot setting and first_snapshot_date
         c.execute("""
             INSERT OR REPLACE INTO server_config (guild_id, auto_snapshot, last_auto_snapshot, first_snapshot_date, chart_style, snapshot_retention_days, auto_snapshot_interval_hours)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -381,7 +386,7 @@ def server_analytics():
             str(guild.id),
             current_auto_snapshot,  # Preserve current auto_snapshot setting
             timestamp.isoformat() if is_auto else None,
-            timestamp.isoformat(),  # first_snapshot_date
+            first_snapshot_date_to_set,  # Only set if not already set
             current_chart_style,
             current_retention_days,
             current_interval_hours
@@ -727,12 +732,29 @@ def server_analytics():
             snap_count = c.fetchone()[0]
             c.execute("SELECT auto_snapshot, last_auto_snapshot, first_snapshot_date, snapshot_retention_days FROM server_config WHERE guild_id = ?", (str(ctx.guild.id),))
             config_row = c.fetchone()
-            conn.close()
             if config_row:
                 auto_snapshot, last_auto_snapshot, first_snapshot_date, retention_days = config_row
             else:
-                auto_snapshot, last_auto_snapshot, first_snapshot_date, retention_days = (0, 'never', 'unknown', DATA_RETENTION_DAYS)
-            msg = f"""**analytics status for {ctx.guild.name}**\n\n• total snapshots: {snap_count}\n• data retention: {retention_days} days\n• auto snapshot: {'enabled' if auto_snapshot else 'disabled'}\n• last auto snapshot: {last_auto_snapshot or 'never'}\n• first snapshot: {first_snapshot_date or 'unknown'}\n"""
+                auto_snapshot, last_auto_snapshot, first_snapshot_date, retention_days = (0, 'never', None, DATA_RETENTION_DAYS)
+
+            # If first_snapshot_date is missing, get it from the earliest snapshot
+            if not first_snapshot_date:
+                c.execute("SELECT MIN(timestamp) FROM snapshots WHERE guild_id = ?", (str(ctx.guild.id),))
+                row = c.fetchone()
+                first_snapshot_date = row[0] if row and row[0] else None
+            conn.close()
+
+            # Format the first snapshot date for display
+            if first_snapshot_date:
+                try:
+                    dt = datetime.fromisoformat(first_snapshot_date)
+                    formatted_first_snapshot = format_time_in_timezone(dt, "%Y-%m-%d %H:%M")
+                except Exception:
+                    formatted_first_snapshot = first_snapshot_date
+            else:
+                formatted_first_snapshot = "unknown"
+
+            msg = f"""**analytics status for {ctx.guild.name}**\n\n• total snapshots: {snap_count}\n• data retention: {retention_days} days\n• auto snapshot: {'enabled' if auto_snapshot else 'disabled'}\n• last auto snapshot: {last_auto_snapshot or 'never'}\n• first snapshot: {formatted_first_snapshot}\n"""
             await ctx.send(msg)
             
         elif cmd == "members":
