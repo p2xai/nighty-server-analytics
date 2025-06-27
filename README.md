@@ -62,7 +62,7 @@ server_analytics/
 
 ---
 
-## API Endpoints (Dashboard)
+## Dashboard Endpoints
 
 - `/` or `/lander`: Landing page with 24-hour statistics
 - `/dashboard?guild_id=...`: Per-server analytics dashboard
