@@ -93,13 +93,6 @@ server_analytics/
 
 ---
 
-## Customization and Extending
-
-- Add new analytics or export features by editing `server_analytics.py`
-- Customize dashboard UI/UX in `analytics_dashboard.py` (HTML/JS is inline)
-- Add new API endpoints as needed for automation or integration
-
----
 
 ## License
 
