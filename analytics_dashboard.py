@@ -1,20 +1,166 @@
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, g
 import sqlite3
 import os
-from datetime import datetime, timezone
-from collections import defaultdict
 import json
+from datetime import datetime, timezone
+from collections import defaultdict, Counter
 import requests
+import time
+import re
 
 app = Flask(__name__)
 DB_PATH = os.path.join(os.path.dirname(__file__), "json", "analytics_test.db")
 
-WEBHOOK_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'server_member_tracking', 'global_analytics_webhook.json')
+# Configuration for NightyScript micro-API
+NIGHTY_API_BASE_URL = os.environ.get('NIGHTY_API_BASE_URL', 'http://127.0.0.1:5500')
+
+WEBHOOK_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'json', 'global_analytics_webhook.json')
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if 'db_conn' not in g:
+        g.db_conn = sqlite3.connect(DB_PATH)
+        g.db_conn.row_factory = sqlite3.Row
+    return g.db_conn
+
+@app.teardown_appcontext
+def close_db(exception=None):
+    db_conn = g.pop('db_conn', None)
+    if db_conn is not None:
+        db_conn.close()
+
+def validate_and_repair_database():
+    """Comprehensive database validation and repair function"""
+    print(" Validating database schema...")
+    
+    # Ensure the database directory exists
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    
+    db = get_db()
+    cursor = db.cursor()
+    
+    # Define expected schema
+    expected_schema = {
+        'server_config': {
+            'columns': [
+                ('guild_id', 'TEXT', 'PRIMARY KEY'),
+                ('guild_name', 'TEXT', ''),
+                ('auto_snapshot', 'BOOLEAN', 'DEFAULT 0'),
+                ('last_auto_snapshot', 'TEXT', ''),
+                ('first_snapshot_date', 'TEXT', ''),
+                ('chart_style', 'TEXT', 'DEFAULT \'emoji\''),
+                ('snapshot_retention_days', 'INTEGER', 'DEFAULT 90'),
+                ('auto_snapshot_interval_hours', 'INTEGER', 'DEFAULT 20'),
+                ('last_snapshot', 'TEXT', '')
+            ]
+        },
+        'snapshots': {
+            'columns': [
+                ('id', 'INTEGER', 'PRIMARY KEY AUTOINCREMENT'),
+                ('guild_id', 'TEXT', 'NOT NULL'),
+                ('guild_name', 'TEXT', ''),
+                ('timestamp', 'TEXT', 'NOT NULL'),
+                ('member_count', 'INTEGER', ''),
+                ('channel_count', 'INTEGER', ''),
+                ('text_channels', 'INTEGER', ''),
+                ('voice_channels', 'INTEGER', ''),
+                ('categories', 'INTEGER', ''),
+                ('role_count', 'INTEGER', ''),
+                ('bots', 'INTEGER', ''),
+                ('boosters', 'INTEGER', ''),
+                ('is_auto', 'BOOLEAN', 'DEFAULT 0')
+            ]
+        },
+        'demographics': {
+            'columns': [
+                ('guild_id', 'TEXT', 'NOT NULL'),
+                ('member_id', 'TEXT', 'NOT NULL'),
+                ('name', 'TEXT', ''),
+                ('account_created', 'TEXT', ''),
+                ('joined_at', 'TEXT', ''),
+                ('timestamp', 'TEXT', ''),
+                ('PRIMARY KEY', '(guild_id, member_id)', '')
+            ]
+        },
+        'demographics_servers': {
+            'columns': [
+                ('guild_id', 'TEXT', 'PRIMARY KEY')
+            ]
+        }
+    }
+    
+    issues_found = []
+    fixes_applied = []
+    
+    # Check if all tables exist
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    existing_tables = [row[0] for row in cursor.fetchall()]
+    
+    for table_name, table_info in expected_schema.items():
+        if table_name not in existing_tables:
+            issues_found.append(f"Missing table: {table_name}")
+            # Create the missing table
+            columns_def = []
+            for col_name, col_type, col_constraints in table_info['columns']:
+                if col_name == 'PRIMARY KEY':
+                    columns_def.append(f"PRIMARY KEY {col_type}")
+                else:
+                    column_def = f"{col_name} {col_type}"
+                    if col_constraints:
+                        column_def += f" {col_constraints}"
+                    columns_def.append(column_def)
+            
+            create_sql = f"CREATE TABLE {table_name} ({', '.join(columns_def)})"
+            try:
+                cursor.execute(create_sql)
+                fixes_applied.append(f"Created table: {table_name}")
+            except Exception as e:
+                issues_found.append(f"Failed to create table {table_name}: {e}")
+    
+    # Check columns in each table
+    for table_name, table_info in expected_schema.items():
+        if table_name in existing_tables:
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            existing_columns = {row[1]: row[2] for row in cursor.fetchall()}
+            
+            for col_name, col_type, col_constraints in table_info['columns']:
+                if col_name == 'PRIMARY KEY':
+                    continue  # Skip primary key constraints for now
+                
+                if col_name not in existing_columns:
+                    issues_found.append(f"Missing column: {table_name}.{col_name}")
+                    # Add the missing column
+                    try:
+                        add_column_sql = f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
+                        if col_constraints and 'DEFAULT' in col_constraints:
+                            add_column_sql += f" {col_constraints}"
+                        cursor.execute(add_column_sql)
+                        fixes_applied.append(f"Added column: {table_name}.{col_name}")
+                    except Exception as e:
+                        issues_found.append(f"Failed to add column {table_name}.{col_name}: {e}")
+    
+    # Check for any foreign key constraints that might be missing
+    # (This is a simplified check - SQLite doesn't enforce foreign keys by default)
+    
+    # Commit any changes
+    if fixes_applied:
+        db.commit()
+        print(f" Applied {len(fixes_applied)} fixes:")
+        for fix in fixes_applied:
+            print(f"   - {fix}")
+    
+    if issues_found:
+        print(f"  Found {len(issues_found)} issues:")
+        for issue in issues_found:
+            print(f"   - {issue}")
+    else:
+        print(" Database schema is valid and complete!")
+    
+    return len(issues_found) == 0
+
+def init_database():
+    """Initialize the database with the required schema"""
+    # Use the new validation and repair function
+    validate_and_repair_database()
 
 def get_global_webhook_url():
     # For now, use a global webhook config file (can be per-server later)
@@ -118,15 +264,50 @@ def lander_page():
             background: #181a1b;
         }
         #sidebar.collapsed + #main-content { margin-left: 40px; }
+        .lander-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 32px;
+            align-items: flex-start;
+            margin-top: 32px;
+        }
         .summary-widget {
             background: #23272a;
             color: #e0e0e0;
             border-radius: 12px;
             box-shadow: 0 2px 12px #000a;
             padding: 28px 36px 24px 36px;
-            margin: 32px 0 0 32px;
             min-width: 320px;
             max-width: 400px;
+            flex: 0 0 340px;
+        }
+        .member-chart-widget {
+            background: #23272a;
+            color: #e0e0e0;
+            border-radius: 12px;
+            box-shadow: 0 2px 12px #000a;
+            padding: 28px 36px 24px 36px;
+            min-width: 320px;
+            max-width: 600px;
+            flex: 1 1 400px;
+            display: flex;
+            flex-direction: column;
+            align-items: stretch;
+            height: 100%;
+        }
+        .member-chart-widget canvas {
+            width: 100% !important;
+            height: 260px !important;
+            max-width: 100%;
+            display: block;
+        }
+        @media (max-width: 900px) {
+            .lander-row { flex-direction: column; gap: 0; }
+            .summary-widget, .member-chart-widget { max-width: 100%; min-width: unset; margin: 0 0 24px 0; }
+        }
+        @media (max-width: 600px) {
+            .summary-widget, .member-chart-widget { margin-left: 8px; margin-right: 8px; min-width: unset; max-width: unset; }
+            #main-content { padding: 16px 4px; }
         }
         .summary-title {
             color: #90caf9;
@@ -163,35 +344,50 @@ def lander_page():
         .summary-delta.positive { color: #4caf50; }
         .summary-delta.negative { color: #f44336; }
         .summary-delta.zero { color: #aaa; }
-        @media (max-width: 600px) {
-            .summary-widget { margin-left: 8px; margin-right: 8px; min-width: unset; max-width: unset; }
-            #main-content { padding: 16px 4px; }
-        }
     </style>
 </head>
 <body>
     <div id="sidebar">
-        <a href="/" id="homeIcon" aria-label="Home">
-            <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#90caf9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5L12 4l9 5.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9.5z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
-        </a>
-        <button class="toggle-btn" onclick="toggleSidebar()">☰</button>
-        <a href="/database" id="databaseLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:12px 16px 8px 16px;cursor:pointer;text-align:left;font-family:inherit;"> Database Search</a>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:4px;padding:16px 0 8px 0;">
+            <a href="/" id="homeIcon" aria-label="Home" style="display:flex;justify-content:center;align-items:center;font-size:2em;color:#90caf9;text-decoration:none;margin:0 0 8px 0;">
+                <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#90caf9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5L12 4l9 5.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9.5z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+            </a>
+            <button class="toggle-btn" onclick="toggleSidebar()" style="font-size:2em;padding:0;background:none;border:none;color:#90caf9;display:flex;justify-content:center;align-items:center;"></button>
+        </div>
+        <a href="/database" id="databaseLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:12px 16px 8px 16px;cursor:pointer;text-align:left;font-family:inherit;">Database Search</a>
         <a href="/config" id="configLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:8px 16px;cursor:pointer;text-align:left;font-family:inherit;">Server Config</a>
-        <ul id="serverList"></ul>
+        <ul id="serverList" style="padding-left:0;"></ul>
         <div style="margin-top: auto; padding-top: 20px; border-top: 1px solid #333;">
             <a href="/analytics-config" id="analyticsConfigLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:8px 16px;cursor:pointer;text-align:left;font-family:inherit;">Analytics Config</a>
         </div>
     </div>
     <div id="main-content">
-        <div class="summary-widget">
-            <div class="summary-title">Last 24 Hours</div>
-            <ul class="summary-list">
-                <li><span class="summary-label">Tracked Members</span> <span class="summary-value" id="membersTotal">...</span> <span class="summary-delta" id="membersDelta"></span></li>
-                <li><span class="summary-label">Snapshots</span> <span class="summary-value" id="snapshotsTotal">...</span> <span class="summary-delta" id="snapshotsDelta"></span></li>
-                <li><span class="summary-label">Tracked Servers</span> <span class="summary-value" id="serversTotal">...</span> <span class="summary-delta" id="serversDelta"></span></li>
-            </ul>
+        <div class="lander-row">
+            <div class="summary-widget">
+                <div class="summary-title">Last 24 Hours</div>
+                <ul class="summary-list">
+                    <li><span class="summary-label">Tracked Members</span> <span class="summary-value" id="membersTotal">...</span> <span class="summary-delta" id="membersDelta"></span></li>
+                    <li><span class="summary-label">Snapshots</span> <span class="summary-value" id="snapshotsTotal">...</span> <span class="summary-delta" id="snapshotsDelta"></span></li>
+                    <li><span class="summary-label">Tracked Servers</span> <span class="summary-value" id="serversTotal">...</span> <span class="summary-delta" id="serversDelta"></span></li>
+                </ul>
+            </div>
+            <div class="member-chart-widget">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+                    <div class="summary-title" style="margin-bottom:0;">Total Member Count</div>
+                    <div>
+                        <label for="memberCountRange" style="color:#90caf9;font-size:0.98em;margin-right:6px;">Range</label>
+                        <select id="memberCountRange" style="background:#23272a;color:#e0e0e0;border:1px solid #333;border-radius:4px;padding:4px 8px;">
+                            <option value="1">1d</option>
+                            <option value="7" selected>7d</option>
+                            <option value="30">30d</option>
+                        </select>
+                    </div>
+                </div>
+                <canvas id="totalMemberCountChart"></canvas>
+            </div>
         </div>
     </div>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('collapsed');
@@ -252,6 +448,71 @@ def lander_page():
             }
         }
         load24hrStats();
+        document.addEventListener('DOMContentLoaded', function() {
+            let totalMemberCountChart = null;
+            async function loadTotalMemberCountChart(days = 7) {
+                let url, labelKey, dataKey;
+                if (days == 1) {
+                    url = '/api/tracked_members_over_time_hourly';
+                    labelKey = 'hours';
+                    dataKey = 'counts';
+                } else {
+                    url = '/api/tracked_members_over_time?days=' + days;
+                    labelKey = 'dates';
+                    dataKey = 'counts';
+                }
+                const res = await fetch(url);
+                const data = await res.json();
+                const ctx = document.getElementById('totalMemberCountChart').getContext('2d');
+                if (totalMemberCountChart) totalMemberCountChart.destroy();
+                // Format labels: for 1d, show only hour (HH:mm); for others, keep as is
+                let labels = data[labelKey];
+                if (days == 1) {
+                    labels = labels.map(ts => ts.slice(11, 16)); // 'HH:mm'
+                }
+                totalMemberCountChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: 'Tracked Members',
+                            data: data[dataKey],
+                            borderColor: '#90caf9',
+                            backgroundColor: 'rgba(144,202,249,0.1)',
+                            fill: true,
+                            tension: 0.3
+                        }]
+                    },
+                    options: {
+                        plugins: { legend: { display: false }, tooltip: { enabled: true } },
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            x: { title: { display: true, text: days == 1 ? 'Hour' : 'Date', color: '#90caf9' }, ticks: { color: '#e0e0e0' }, grid: { color: '#333' } },
+                            y: {
+                                title: { display: true, text: 'Tracked Members', color: '#90caf9' },
+                                ticks: {
+                                    color: '#e0e0e0',
+                                    stepSize: 1,
+                                    callback: function(value) { return Number(value).toLocaleString(); },
+                                    precision: 0
+                                },
+                                grid: { color: '#333' },
+                                beginAtZero: true
+                            }
+                        },
+                        interaction: { mode: 'nearest', intersect: false },
+                        hover: { mode: 'nearest', intersect: false }
+                    }
+                });
+            }
+            document.getElementById('memberCountRange').addEventListener('change', function() {
+                loadTotalMemberCountChart(this.value);
+            });
+            // Initial load: use the dropdown's current value
+            const initialRange = document.getElementById('memberCountRange').value;
+            loadTotalMemberCountChart(initialRange);
+        });
     </script>
 </body>
 </html>
@@ -626,8 +887,13 @@ def database_page():
     </head>
     <body>
         <div id="sidebar">
-            <button class="toggle-btn" onclick="toggleSidebar()">☰</button>
-            <a href="/database" id="databaseLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:12px 16px 8px 16px;cursor:pointer;text-align:left;font-family:inherit;"> Database Search</a>
+            <div style="display:flex;flex-direction:column;align-items:center;gap:4px;padding:16px 0 8px 0;">
+                <a href="/" id="homeIcon" aria-label="Home" style="display:flex;justify-content:center;align-items:center;font-size:2em;color:#90caf9;text-decoration:none;margin:0 0 8px 0;">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#90caf9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5L12 4l9 5.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9.5z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+                </a>
+                <button class="toggle-btn" onclick="toggleSidebar()" style="font-size:2em;padding:0;background:none;border:none;color:#90caf9;display:flex;justify-content:center;align-items:center;"></button>
+            </div>
+            <a href="/database" id="databaseLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:12px 16px 8px 16px;cursor:pointer;text-align:left;font-family:inherit;">Database Search</a>
             <a href="/config" id="configLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:8px 16px;cursor:pointer;text-align:left;font-family:inherit;">Server Config</a>
             <ul id="serverList"></ul>
             <div style="margin-top: auto; padding-top: 20px; border-top: 1px solid #333;">
@@ -1149,16 +1415,27 @@ def config_page():
     </head>
     <body>
         <div id="sidebar">
-            <button class="toggle-btn" onclick="toggleSidebar()">☰</button>
-            <a href="/database" id="databaseLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:12px 16px 8px 16px;cursor:pointer;text-align:left;font-family:inherit;"> Database Search</a>
+            <div style="display:flex;flex-direction:column;align-items:center;gap:4px;padding:16px 0 8px 0;">
+                <a href="/" id="homeIcon" aria-label="Home" style="display:flex;justify-content:center;align-items:center;font-size:2em;color:#90caf9;text-decoration:none;margin:0 0 8px 0;">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#90caf9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5L12 4l9 5.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9.5z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+                </a>
+                <button class="toggle-btn" onclick="toggleSidebar()" style="font-size:2em;padding:0;background:none;border:none;color:#90caf9;display:flex;justify-content:center;align-items:center;"></button>
+            </div>
+            <a href="/database" id="databaseLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:12px 16px 8px 16px;cursor:pointer;text-align:left;font-family:inherit;">Database Search</a>
             <a href="/config" id="configLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:8px 16px;cursor:pointer;text-align:left;font-family:inherit;">Server Config</a>
-            <ul id="serverList"></ul>
+            <ul id="serverList" style="padding-left:0;"></ul>
             <div style="margin-top: auto; padding-top: 20px; border-top: 1px solid #333;">
                 <a href="/analytics-config" id="analyticsConfigLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:8px 16px;cursor:pointer;text-align:left;font-family:inherit;">Analytics Config</a>
             </div>
         </div>
         <div id="main-content">
-            <h1 style="color:#90caf9;margin-top:0;">Server Configuration Editor</h1>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;">
+                <h1 style="color:#90caf9;margin-top:0;">Server Configuration Editor</h1>
+                <div>
+                    <button id="snapshotAllBtn" class="snapshot-btn" style="font-size:1.05em;padding:10px 22px;">Snapshot All</button>
+                    <button id="fetchAllBtn" class="snapshot-btn" style="font-size:1.05em;padding:10px 22px;background:#4caf50;margin-left:10px;">Fetch All</button>
+                </div>
+            </div>
             <div id="configTableContainer">
                 <table class="config-table">
                     <thead>
@@ -1168,7 +1445,7 @@ def config_page():
                             <th>Interval (hours)</th>
                             <th>Retention (days)</th>
                             <th>First Snapshot</th>
-                            <th>Last Auto Snapshot</th>
+                            <th>Last Snapshot</th>
                             <th>Actions</th>
                         </tr>
                     </thead>
@@ -1237,6 +1514,25 @@ def config_page():
                 return tsStr;
             }
             
+            function formatTimeSince(ts) {
+                if (!ts) return 'Never';
+                const tsStr = String(ts);
+                const timestamp = new Date(tsStr);
+                const now = new Date();
+                const diffMs = now - timestamp;
+                const diffMins = Math.floor(diffMs / (1000 * 60));
+                const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+                const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+                
+                if (diffMins < 1) return 'Just now';
+                if (diffMins < 60) return `${diffMins}m ago`;
+                if (diffHours < 24) return `${diffHours}h ago`;
+                if (diffDays < 7) return `${diffDays}d ago`;
+                
+                // For longer periods, show the actual date
+                return formatTimestamp(ts);
+            }
+            
             async function loadConfigs() {
                 try {
                     const res = await fetch('/api/server_configs');
@@ -1276,22 +1572,22 @@ def config_page():
                             <span class="status-indicator ${config.auto_snapshot ? 'status-active' : 'status-inactive'}"></span>
                             <label class="toggle-switch">
                                 <input type="checkbox" ${config.auto_snapshot ? 'checked' : ''} 
-                                       onchange="updateConfig('${config.guild_id}', 'auto_snapshot', this.checked)">
+                                    onchange="updateConfig('${config.guild_id}', 'auto_snapshot', this.checked)">
                                 <span class="slider"></span>
                             </label>
                         </td>
                         <td>
                             <input type="number" class="number-input" value="${config.auto_snapshot_interval_hours || 20}" 
-                                   min="1" max="168" step="1" 
-                                   onchange="updateConfig('${config.guild_id}', 'auto_snapshot_interval_hours', this.value)">
+                                min="1" max="168" step="1" 
+                                onchange="updateConfig('${config.guild_id}', 'auto_snapshot_interval_hours', this.value)">
                         </td>
                         <td>
                             <input type="number" class="number-input" value="${config.snapshot_retention_days || 90}" 
-                                   min="1" max="365" 
-                                   onchange="updateConfig('${config.guild_id}', 'snapshot_retention_days', this.value)">
+                                min="1" max="365" 
+                                onchange="updateConfig('${config.guild_id}', 'snapshot_retention_days', this.value)">
                         </td>
                         <td>${formatTimestamp(config.first_snapshot_date)}</td>
-                        <td>${formatTimestamp(config.last_auto_snapshot)}</td>
+                        <td>${formatTimeSince(config.last_auto_snapshot)}</td>
                         <td>
                             <button class="snapshot-btn" onclick="takeSnapshot('${config.guild_id}')">Take Snapshot</button>
                             <br><br>
@@ -1428,6 +1724,88 @@ def config_page():
                 }
             }
             
+            async function testAutoSnapshot(guildId) {
+                const button = document.querySelector(`tr[data-guild-id="${guildId}"] .snapshot-btn[onclick*="testAutoSnapshot"]`);
+                const originalText = button.textContent;
+                
+                // Show loading state
+                button.textContent = 'Testing...';
+                button.disabled = true;
+                button.classList.add('loading');
+                
+                try {
+                    const res = await fetch('/api/test_auto_snapshot/' + guildId, {
+                        method: 'POST'
+                    });
+                    
+                    if (!res.ok) {
+                        const errorData = await res.json();
+                        throw new Error(errorData.error || 'Failed to test auto snapshot');
+                    }
+                    
+                    const data = await res.json();
+                    
+                    if (data.success) {
+                        showNotification(`Test auto snapshot notification sent successfully! Check your webhook.`, false);
+                    } else {
+                        throw new Error(data.error || 'Unknown error occurred');
+                    }
+                    
+                } catch (e) {
+                    console.error('Test auto snapshot error:', e);
+                    showNotification(`Failed to test auto snapshot: ${e.message}`, true);
+                } finally {
+                    // Restore button state
+                    button.textContent = originalText;
+                    button.disabled = false;
+                    button.classList.remove('loading');
+                }
+            }
+            
+            async function snapshotAllServers() {
+                const btn = document.getElementById('snapshotAllBtn');
+                btn.disabled = true;
+                btn.textContent = 'Snapshotting...';
+                try {
+                    const res = await fetch('/api/snapshot_all', { method: 'POST' });
+                    const data = await res.json();
+                    if (data.success) {
+                        showNotification(`Snapshot taken for all servers! (${data.count} servers)`);
+                        await loadConfigs();
+                    } else {
+                        showNotification(data.error || 'Snapshot all failed', true);
+                    }
+                } catch (e) {
+                    showNotification('Snapshot all failed', true);
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = 'Snapshot All';
+                }
+            }
+            document.getElementById('snapshotAllBtn').addEventListener('click', snapshotAllServers);
+            
+            async function fetchAllServers() {
+                const btn = document.getElementById('fetchAllBtn');
+                btn.disabled = true;
+                btn.textContent = 'Fetching...';
+                try {
+                    const res = await fetch('/api/fetch_all', { method: 'POST' });
+                    const data = await res.json();
+                    if (data.success) {
+                        showNotification(`Fetched members for all servers! (${data.count} servers)`);
+                        await loadConfigs();
+                    } else {
+                        showNotification(data.error || 'Fetch all failed', true);
+                    }
+                } catch (e) {
+                    showNotification('Fetch all failed', true);
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = 'Fetch All';
+                }
+            }
+            document.getElementById('fetchAllBtn').addEventListener('click', fetchAllServers);
+            
             loadServers();
             loadConfigs();
         </script>
@@ -1556,10 +1934,15 @@ def analytics_config_page():
     </head>
     <body>
         <div id="sidebar">
-            <button class="toggle-btn" onclick="toggleSidebar()">☰</button>
+            <div style="display:flex;flex-direction:column;align-items:center;gap:4px;padding:16px 0 8px 0;">
+                <a href="/" id="homeIcon" aria-label="Home" style="display:flex;justify-content:center;align-items:center;font-size:2em;color:#90caf9;text-decoration:none;margin:0 0 8px 0;">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#90caf9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5L12 4l9 5.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9.5z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+                </a>
+                <button class="toggle-btn" onclick="toggleSidebar()" style="font-size:2em;padding:0;background:none;border:none;color:#90caf9;display:flex;justify-content:center;align-items:center;"></button>
+            </div>
             <a href="/database" id="databaseLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:12px 16px 8px 16px;cursor:pointer;text-align:left;font-family:inherit;"> Database Search</a>
             <a href="/config" id="configLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:8px 16px;cursor:pointer;text-align:left;font-family:inherit;">Server Config</a>
-            <ul id="serverList"></ul>
+            <ul id="serverList" style="padding-left:0;"></ul>
             <div style="margin-top: auto; padding-top: 20px; border-top: 1px solid #333;">
                 <a href="/analytics-config" id="analyticsConfigLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:8px 16px;cursor:pointer;text-align:left;font-family:inherit;">Analytics Config</a>
             </div>
@@ -1607,13 +1990,12 @@ def analytics_config_page():
                     };
                     list.appendChild(li);
                     if ((lastSelected && srv.id === lastSelected) || (!lastSelected && idx === 0)) {
-                        selectServer(srv.id, li);
+                        li.classList.add('active');
                         found = true;
                     }
                 });
-                // If lastSelected not found, select the first one
                 if (!found && servers.length > 0) {
-                    selectServer(servers[0].id, list.firstChild);
+                    list.firstChild.classList.add('active');
                 }
             }
             loadServers();
@@ -1683,7 +2065,7 @@ def trigger_fetch_members(guild_id):
         # Get the API token from environment variable
         api_token = os.environ.get('NIGHTY_API_TOKEN', 'default_token_change_me')
         # Prepare the request to the NightyScript micro-API
-        api_url = f'http://127.0.0.1:5500/fetch_members'
+        api_url = f'{NIGHTY_API_BASE_URL}/fetch_members'
         headers = {
             'Authorization': f'Bearer {api_token}',
             'Content-Type': 'application/json'
@@ -1711,7 +2093,8 @@ def trigger_fetch_members(guild_id):
                 "title": "Fetched Members",
                 "description": f"Fetched members for {guild_name} at {timestamp}",
                 "fields": [
-                    {"name": "Member Count", "value": str(member_count), "inline": True}
+                    {"name": "Member Count", "value": str(member_count), "inline": True},
+                    {"name": "Server ID", "value": str(guild_id), "inline": True}
                 ],
                 "color": 0x90caf9
             }
@@ -1746,15 +2129,17 @@ def server_stats(guild_id):
     db = get_db()
     import datetime
     # Get all snapshots for this server
-    rows = db.execute('SELECT timestamp, member_count FROM snapshots WHERE guild_id=? ORDER BY timestamp', (guild_id,)).fetchall()
+    rows = db.execute('SELECT timestamp, member_count, boosters FROM snapshots WHERE guild_id=? ORDER BY timestamp', (guild_id,)).fetchall()
     if not rows:
         return jsonify({})
     member_counts = [row['member_count'] for row in rows]
+    booster_counts = [row['boosters'] if 'boosters' in row.keys() else None for row in rows]
     timestamps = [row['timestamp'] for row in rows]
     peak = max(member_counts)
     peak_idx = member_counts.index(peak)
     peak_date = timestamps[peak_idx][:16].replace('T', ' ')
     current = member_counts[-1]
+    current_boosters = booster_counts[-1] if booster_counts[-1] is not None else 0
     first = member_counts[0]
     last_snapshot = timestamps[-1][:16].replace('T', ' ')
     # Time since last snapshot
@@ -1771,7 +2156,7 @@ def server_stats(guild_id):
         'peak_member_count': peak,
         'peak_member_date': peak_date,
         'current_member_count': current,
-        'change_from_peak': f"{current - peak:+}",
+        'current_boosters': current_boosters,
         'change_since_first': f"{current - first:+}",
         'last_snapshot': last_snapshot,
         'time_since_last': time_since,
@@ -2048,24 +2433,33 @@ def dashboard():
                 background: #23272a;
                 border-radius: 8px;
                 padding: 24px;
-                margin-top: 32px;
+                margin-top: 0;
                 box-shadow: 0 2px 8px #000a;
-                width: 100%;
+                flex: 1 1 400px;
+                min-width: 320px;
                 max-width: 100%;
+                margin-left: 0;
+                margin-right: 0;
+                display: flex;
+                flex-direction: column;
+                align-items: stretch;
             }
             .full-width-chart canvas {
                 width: 100% !important;
                 height: 260px !important;
                 max-width: 100%;
+                display: block;
             }
         </style>
     </head>
     <body>
         <div id="sidebar">
-            <a href="/" id="homeIcon" aria-label="Home">
-                <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#90caf9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5L12 4l9 5.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9.5z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
-            </a>
-            <button class="toggle-btn" onclick="toggleSidebar()">☰</button>
+            <div style="display:flex;flex-direction:column;align-items:center;gap:4px;padding:16px 0 8px 0;">
+                <a href="/" id="homeIcon" aria-label="Home" style="display:flex;justify-content:center;align-items:center;font-size:2em;color:#90caf9;text-decoration:none;margin:0 0 8px 0;">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#90caf9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5L12 4l9 5.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9.5z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+                </a>
+                <button class="toggle-btn" onclick="toggleSidebar()" style="font-size:2em;padding:0;background:none;border:none;color:#90caf9;display:flex;justify-content:center;align-items:center;"></button>
+            </div>
             <a href="/database" id="databaseLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:12px 16px 8px 16px;cursor:pointer;text-align:left;font-family:inherit;"> Database Search</a>
             <a href="/config" id="configLink" style="display:block;text-decoration:none;color:#90caf9;background:none;border:none;font-size:1.1em;padding:8px 16px;cursor:pointer;text-align:left;font-family:inherit;">Server Config</a>
             <ul id="serverList"></ul>
@@ -2077,11 +2471,14 @@ def dashboard():
             <h1>Analytics Overview</h1>
             <div class="dashboard-row">
                 <div id="serverStatsCard" class="stat-list" style="display:none;min-width:320px;max-width:400px;">
-                    <div style="font-weight:bold;font-size:1.2em;color:#90caf9;margin-bottom:10px;">Server Stats</div>
+                    <div style="font-weight:bold;font-size:1.2em;color:#90caf9;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;">
+                        <span>Server Stats</span>
+                        <span id="peakMemberDate" style="color:#aaa;font-size:0.95em;margin-left:16px;"></span>
+                    </div>
                     <ul style="font-size:1em;">
-                        <li><span class="stat-label">Peak Member Count:</span> <span class="stat-value" id="peakMemberCount">...</span> <span id="peakMemberDate" style="color:#aaa;font-size:0.95em;"></span></li>
+                        <li><span class="stat-label">Peak Member Count:</span> <span class="stat-value" id="peakMemberCount">...</span></li>
                         <li><span class="stat-label">Current Member Count:</span> <span class="stat-value" id="currentMemberCount">...</span></li>
-                        <li><span class="stat-label">Change from Peak:</span> <span class="stat-value" id="changeFromPeak">...</span></li>
+                        <li><span class="stat-label">Booster Count:</span> <span class="stat-value" id="boosterCount">...</span></li>
                         <li><span class="stat-label">Change since First Snapshot:</span> <span class="stat-value" id="changeSinceFirst">...</span></li>
                         <li><span class="stat-label">Last Snapshot:</span> <span class="stat-value" id="lastSnapshot">...</span></li>
                         <li><span class="stat-label">Time Since Last Snapshot:</span> <span class="stat-value" id="timeSinceLast">...</span></li>
@@ -2093,19 +2490,22 @@ def dashboard():
                     <canvas id="snapshots24hChart"></canvas>
                 </div>
             </div>
-            <div class="full-width-chart">
-                <div style="margin-bottom: 10px;">
-                    <label for="membersDaysSelect" style="color:#90caf9;">Show last</label>
-                    <select id="membersDaysSelect">
-                        <option value="7" selected>7 days</option>
-                        <option value="14">14 days</option>
-                        <option value="30">30 days</option>
-                        <option value="90">90 days</option>
-                        <option value="all">All</option>
-                    </select>
+            <!-- New flex row for both charts -->
+            <div class="dashboard-row" style="margin-top:0;">
+                <div class="full-width-chart">
+                    <div style="margin-bottom: 10px;">
+                        <label for="membersDaysSelect" style="color:#90caf9;">Show last</label>
+                        <select id="membersDaysSelect">
+                            <option value="7" selected>7 days</option>
+                            <option value="14">14 days</option>
+                            <option value="30">30 days</option>
+                            <option value="90">90 days</option>
+                            <option value="all">All</option>
+                        </select>
+                    </div>
+                    <div class="chart-title">Unique Members Tracked Over Time</div>
+                    <canvas id="membersOverTimeChart"></canvas>
                 </div>
-                <div class="chart-title">Unique Members Tracked Over Time</div>
-                <canvas id="membersOverTimeChart"></canvas>
             </div>
             <div id="demographicsSection" style="display:none; margin-top:32px;">
                 <div class="demographics-collapsible" style="background:#23272a;color:#e0e0e0;border-radius:8px;padding:20px 28px;margin-bottom:18px;box-shadow:0 2px 8px #000a;">
@@ -2383,15 +2783,89 @@ def dashboard():
                 const data = await res.json();
                 document.getElementById('serverStatsCard').style.display = '';
                 document.getElementById('peakMemberCount').textContent = data.peak_member_count?.toLocaleString() ?? '...';
+                // Append (+/-) difference from current after the peak value
+                if (typeof data.peak_member_count === 'number' && typeof data.current_member_count === 'number') {
+                    const diff = data.current_member_count - data.peak_member_count;
+                    let diffStr = '';
+                    if (diff !== 0) {
+                        diffStr = ` (${diff > 0 ? '+' : ''}${diff.toLocaleString()})`;
+                    } else {
+                        diffStr = ' (0)';
+                    }
+                    document.getElementById('peakMemberCount').textContent += diffStr;
+                }
                 document.getElementById('peakMemberDate').textContent = data.peak_member_date ? `(at ${data.peak_member_date} UTC)` : '';
                 document.getElementById('currentMemberCount').textContent = data.current_member_count?.toLocaleString() ?? '...';
-                document.getElementById('changeFromPeak').textContent = data.change_from_peak ?? '...';
                 document.getElementById('changeSinceFirst').textContent = data.change_since_first ?? '...';
                 document.getElementById('lastSnapshot').textContent = data.last_snapshot ? `${data.last_snapshot} UTC` : '...';
                 document.getElementById('timeSinceLast').textContent = data.time_since_last ?? '...';
                 document.getElementById('totalSnapshots').textContent = data.total_snapshots?.toLocaleString() ?? '...';
+                document.getElementById('boosterCount').textContent = data.current_boosters?.toLocaleString() ?? '...';
             }
             loadServerStats();
+
+            let totalMemberCountChart = null;
+            async function loadTotalMemberCountChart(days = 7) {
+                let url, labelKey, dataKey;
+                if (days == 1) {
+                    url = '/api/tracked_members_over_time_hourly';
+                    labelKey = 'hours';
+                    dataKey = 'counts';
+                } else {
+                    url = '/api/tracked_members_over_time?days=' + days;
+                    labelKey = 'dates';
+                    dataKey = 'counts';
+                }
+                const res = await fetch(url);
+                const data = await res.json();
+                const ctx = document.getElementById('totalMemberCountChart').getContext('2d');
+                if (totalMemberCountChart) totalMemberCountChart.destroy();
+                // Format labels: for 1d, show only hour (HH:mm); for others, keep as is
+                let labels = data[labelKey];
+                if (days == 1) {
+                    labels = labels.map(ts => ts.slice(11, 16)); // 'HH:mm'
+                }
+                totalMemberCountChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: 'Tracked Members',
+                            data: data[dataKey],
+                            borderColor: '#90caf9',
+                            backgroundColor: 'rgba(144,202,249,0.1)',
+                            fill: true,
+                            tension: 0.3
+                        }]
+                    },
+                    options: {
+                        plugins: { legend: { display: false }, tooltip: { enabled: true } },
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            x: { title: { display: true, text: days == 1 ? 'Hour' : 'Date', color: '#90caf9' }, ticks: { color: '#e0e0e0' }, grid: { color: '#333' } },
+                            y: {
+                                title: { display: true, text: 'Tracked Members', color: '#90caf9' },
+                                ticks: {
+                                    color: '#e0e0e0',
+                                    stepSize: 1,
+                                    callback: function(value) { return Number(value).toLocaleString(); },
+                                    precision: 0
+                                },
+                                grid: { color: '#333' },
+                                beginAtZero: true
+                            }
+                        },
+                        interaction: { mode: 'nearest', intersect: false },
+                        hover: { mode: 'nearest', intersect: false }
+                    }
+                });
+            }
+            document.getElementById('memberCountRange').addEventListener('change', function() {
+                loadTotalMemberCountChart(this.value);
+            });
+            // Initial load
+            loadTotalMemberCountChart(7);
         </script>
     </body>
     </html>
@@ -2424,8 +2898,8 @@ def get_server_configs():
             if not existing:
                 db.execute('''
                     INSERT INTO server_config (guild_id, auto_snapshot, last_auto_snapshot, 
-                                             first_snapshot_date, chart_style, snapshot_retention_days, 
-                                             auto_snapshot_interval_hours)
+                                            first_snapshot_date, chart_style, snapshot_retention_days, 
+                                            auto_snapshot_interval_hours)
                     VALUES (?, 0, NULL, NULL, 'emoji', 90, 20)
                 ''', (server['guild_id'],))
         # Get first snapshot date for each server
@@ -2444,16 +2918,28 @@ def get_server_configs():
         # Now get all configs with first_snapshot_date
         configs = db.execute('''
             SELECT guild_id, auto_snapshot, last_auto_snapshot, 
-                   first_snapshot_date, snapshot_retention_days, 
-                   auto_snapshot_interval_hours
+                first_snapshot_date, snapshot_retention_days, 
+                auto_snapshot_interval_hours
             FROM server_config 
             WHERE first_snapshot_date IS NOT NULL
             ORDER BY guild_id
         ''').fetchall()
+        
+        # Get the most recent snapshot for each server
+        latest_snapshots = db.execute('''
+            SELECT guild_id, MAX(timestamp) as last_snapshot
+            FROM snapshots 
+            GROUP BY guild_id
+        ''').fetchall()
+        
+        # Create a lookup for latest snapshots
+        latest_snapshot_lookup = {row['guild_id']: row['last_snapshot'] for row in latest_snapshots}
+        
         # Get server names
         server_names = {}
         for row in db.execute('SELECT guild_id, guild_name FROM snapshots WHERE guild_name IS NOT NULL GROUP BY guild_id').fetchall():
             server_names[row['guild_id']] = row['guild_name']
+        
         result = []
         for row in configs:
             result.append({
@@ -2461,6 +2947,7 @@ def get_server_configs():
                 'guild_name': server_names.get(row['guild_id'], f"Server {row['guild_id']}"),
                 'auto_snapshot': bool(row['auto_snapshot']),
                 'last_auto_snapshot': row['last_auto_snapshot'],
+                'last_snapshot': latest_snapshot_lookup.get(row['guild_id']),
                 'first_snapshot_date': row['first_snapshot_date'],
                 'snapshot_retention_days': row['snapshot_retention_days'],
                 'auto_snapshot_interval_hours': row['auto_snapshot_interval_hours']
@@ -2470,5 +2957,473 @@ def get_server_configs():
         print(f"Error in get_server_configs: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/update_config', methods=['POST'])
+def update_server_config():
+    """Update server configuration settings"""
+    try:
+        data = request.get_json()
+        guild_id = data.get('guild_id')
+        field = data.get('field')
+        value = data.get('value')
+        
+        if not guild_id or not field:
+            return jsonify({'error': 'Missing guild_id or field'}), 400
+        
+        db = get_db()
+        
+        # Validate field name to prevent SQL injection
+        allowed_fields = {
+            'auto_snapshot', 'auto_snapshot_interval_hours', 
+            'snapshot_retention_days', 'chart_style'
+        }
+        
+        if field not in allowed_fields:
+            return jsonify({'error': f'Invalid field: {field}'}), 400
+        
+        # Convert boolean for auto_snapshot
+        if field == 'auto_snapshot':
+            value = 1 if value else 0
+        elif field in ['auto_snapshot_interval_hours', 'snapshot_retention_days']:
+            try:
+                value = int(value)
+                if value <= 0:
+                    return jsonify({'error': f'{field} must be positive'}), 400
+            except (ValueError, TypeError):
+                return jsonify({'error': f'{field} must be a number'}), 400
+        
+        # Update the configuration
+        db.execute(f'UPDATE server_config SET {field} = ? WHERE guild_id = ?', (value, guild_id))
+        db.commit()
+        
+        # Log the update via webhook
+        field_name = field.replace('_', ' ').title()
+        embed = {
+            "title": "Configuration Updated",
+            "description": f"Updated {field_name} for server {guild_id}",
+            "fields": [
+                {"name": "Field", "value": field_name, "inline": True},
+                {"name": "Value", "value": str(value), "inline": True},
+                {"name": "Server ID", "value": str(guild_id), "inline": True}
+            ],
+            "color": 0x90caf9
+        }
+        send_webhook_log("", embed=embed)
+        
+        return jsonify({'success': True})
+        
+    except Exception as e:
+        print(f"Error updating config: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/take_snapshot/<guild_id>', methods=['POST'])
+def take_manual_snapshot(guild_id):
+    """Take a manual snapshot for a specific server"""
+    try:
+        import requests
+        import os
+        from datetime import datetime, timezone
+        
+        # Get the API token from environment variable
+        api_token = os.environ.get('NIGHTY_API_TOKEN', 'default_token_change_me')
+        
+        # Prepare the request to the NightyScript micro-API
+        api_url = f'{NIGHTY_API_BASE_URL}/take_snapshot'
+        headers = {
+            'Authorization': f'Bearer {api_token}',
+            'Content-Type': 'application/json'
+        }
+        data = {
+            'guild_id': str(guild_id),
+            'token': api_token,
+            'manual': True
+        }
+        
+        print(f"[Analytics] Making request to {api_url} for guild {guild_id}")
+        
+        # Make the request to the NightyScript micro-API
+        response = requests.post(api_url, headers=headers, json=data, timeout=30)
+        
+        print(f"[Analytics] Response status: {response.status_code}")
+        print(f"[Analytics] Response content: {response.text[:200]}...")
+        
+        if response.status_code == 200:
+            try:
+                result = response.json()
+            except json.JSONDecodeError as e:
+                print(f"[Analytics] JSON decode error: {e}")
+                print(f"[Analytics] Full response content: {response.text}")
+                return jsonify({
+                    'success': False,
+                    'error': f'Invalid JSON response from micro-API: {response.text[:100]}'
+                }), 500
+            
+            # Update last_snapshot in database (do NOT update last_auto_snapshot for manual)
+            db = get_db()
+            now = datetime.now(timezone.utc)
+            db.execute(
+                'UPDATE server_config SET last_auto_snapshot = ? WHERE guild_id = ?',
+                (now.isoformat(), guild_id)
+            )
+            db.commit()
+            
+            # Webhook log on success
+            # guild_name = result.get('guild_name', f'Server {guild_id}')
+            # member_count = result.get('member_count', 0)
+            # timestamp = now.strftime('%Y-%m-%d %H:%M:%S UTC')
+            # embed = {
+            #     "title": "Manual Snapshot Taken",
+            #     "description": f"Manual snapshot taken for {guild_name} at {timestamp}",
+            #     "fields": [
+            #         {"name": "Member Count", "value": str(member_count), "inline": True},
+            #         {"name": "Type", "value": "Manual", "inline": True},
+            #         {"name": "Server ID", "value": str(guild_id), "inline": True}
+            #     ],
+            #     "color": 0x4caf50
+            # }
+            # send_webhook_log("", embed=embed)
+            
+            return jsonify({
+                'success': True,
+                'message': f'Snapshot taken successfully for server {guild_id}',
+                'member_count': result.get('member_count', 0),
+                'guild_name': result.get('guild_name', f'Server {guild_id}')
+            })
+        else:
+            # Try to parse error response as JSON, but handle non-JSON responses
+            try:
+                error_data = response.json()
+                error_message = error_data.get('error', f'HTTP {response.status_code}')
+            except json.JSONDecodeError:
+                error_message = f'HTTP {response.status_code}: {response.text[:100]}'
+            
+            return jsonify({
+                'success': False,
+                'error': error_message
+            }), response.status_code
+            
+    except requests.exceptions.ConnectionError:
+        return jsonify({
+            'success': False,
+            'error': 'Cannot connect to NightyScript micro-API. Make sure the NightyScript is running.'
+        }), 503
+    except requests.exceptions.Timeout:
+        return jsonify({
+            'success': False,
+            'error': 'Request to NightyScript micro-API timed out.'
+        }), 504
+    except Exception as e:
+        print(f"[Analytics] Unexpected error in take_manual_snapshot: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/auto_snapshot_notification', methods=['POST'])
+def receive_auto_snapshot_notification():
+    """Receive auto snapshot notifications from the NightyScript micro-API"""
+    try:
+        # Verify the request is from the micro-API
+        auth_header = request.headers.get('Authorization')
+        api_token = os.environ.get('NIGHTY_API_TOKEN', 'default_token_change_me')
+        
+        if not auth_header or auth_header != f'Bearer {api_token}':
+            return jsonify({'error': 'Unauthorized'}), 401
+        
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        guild_id = data.get('guild_id')
+        guild_name = data.get('guild_name', f'Server {guild_id}')
+        member_count = data.get('member_count', 0)
+        timestamp = data.get('timestamp')
+        is_auto = data.get('is_auto', True)
+        
+        if not guild_id:
+            return jsonify({'error': 'Missing guild_id'}), 400
+        
+        # Update last_auto_snapshot in database if this was an auto snapshot
+        if is_auto:
+            db = get_db()
+            db.execute(
+                'UPDATE server_config SET last_auto_snapshot = ?, last_snapshot = ? WHERE guild_id = ?',
+                (timestamp, timestamp, guild_id)
+            )
+            db.commit()
+        
+        # Format timestamp for display
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                # Format to match other webhook messages: "2025-06-26 22:28:14 UTC"
+                display_time = dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+            except:
+                display_time = timestamp
+        else:
+            display_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        
+        # Webhook log
+        snapshot_type = "Auto" if is_auto else "Manual"
+        color = 0x2196f3 if is_auto else 0x4caf50  # Blue for auto, green for manual
+        
+        embed = {
+            "title": f"{snapshot_type} Snapshot Taken",
+            "description": f"{snapshot_type.lower().capitalize()} snapshot taken for {guild_name} at {display_time}",
+            "fields": [
+                {"name": "Member Count", "value": str(member_count), "inline": True},
+                {"name": "Type", "value": snapshot_type, "inline": True},
+                {"name": "Server ID", "value": str(guild_id), "inline": True}
+            ],
+            "color": color
+        }
+        send_webhook_log("", embed=embed)
+        
+        print(f"[Analytics] Received {snapshot_type.lower()} snapshot notification for {guild_name} ({guild_id})")
+        
+        return jsonify({'success': True, 'message': f'{snapshot_type} snapshot logged successfully'})
+        
+    except Exception as e:
+        print(f"[Analytics] Error in auto_snapshot_notification: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/test_auto_snapshot/<guild_id>', methods=['POST'])
+def test_auto_snapshot(guild_id):
+    """Test endpoint to simulate an auto snapshot notification"""
+    try:
+        from datetime import datetime, timezone
+        
+        # Create a test auto snapshot notification
+        test_data = {
+            'guild_id': str(guild_id),
+            'guild_name': f'Test Server {guild_id}',
+            'member_count': 1234,  # Test member count
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'is_auto': True
+        }
+        
+        # Send the notification to our own endpoint
+        response = requests.post(
+            f'http://127.0.0.1:5000/api/auto_snapshot_notification',
+            headers={'Authorization': f'Bearer {os.environ.get("NIGHTY_API_TOKEN", "default_token_change_me")}'},
+            json=test_data,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            return jsonify({
+                'success': True,
+                'message': 'Test auto snapshot notification sent successfully',
+                'test_data': test_data
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': f'Failed to send test notification: {response.text}'
+            }), response.status_code
+            
+    except Exception as e:
+        print(f"[Analytics] Error in test_auto_snapshot: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/snapshot_all', methods=['POST'])
+def snapshot_all():
+    import requests
+    import os
+    import time
+    try:
+        db = get_db()
+        api_token = os.environ.get('NIGHTY_API_TOKEN', 'default_token_change_me')
+        api_url = os.environ.get('NIGHTY_API_BASE_URL', 'http://127.0.0.1:5500') + '/take_snapshot'
+        servers = db.execute('SELECT DISTINCT guild_id FROM server_config').fetchall()
+        if not servers:
+            servers = db.execute('SELECT DISTINCT guild_id FROM snapshots').fetchall()
+        count = 0
+        errors = []
+        failed_servers = []
+        for row in servers:
+            guild_id = row['guild_id'] if isinstance(row, dict) else row[0]
+            try:
+                res = requests.post(api_url, headers={
+                    'Authorization': f'Bearer {api_token}',
+                    'Content-Type': 'application/json'
+                }, json={
+                    'guild_id': str(guild_id),
+                    'token': api_token,
+                    'manual': True
+                }, timeout=30)
+                if res.status_code == 200:
+                    count += 1
+                else:
+                    errors.append(f'{guild_id}: {res.text[:100]}')
+                    failed_servers.append(str(guild_id))
+            except Exception as e:
+                errors.append(f'{guild_id}: {str(e)}')
+                failed_servers.append(str(guild_id))
+            time.sleep(5)
+        # Send summary webhook
+        summary = f"Snapshot All Complete\nSuccess: {count}\nFailed: {len(failed_servers)}"
+        if failed_servers:
+            summary += f"\nFailed Servers: {', '.join(failed_servers)}"
+        embed = {
+            "title": "Snapshot All Summary",
+            "description": summary,
+            "color": 0x90caf9 if not failed_servers else 0xf44336
+        }
+        send_webhook_log("", embed=embed)
+        if errors:
+            return {'success': False, 'error': f'Errors for some servers: {errors}', 'count': count}
+        return {'success': True, 'count': count}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+@app.route('/api/tracked_members_over_time')
+def tracked_members_over_time():
+    db = get_db()
+    import datetime
+
+    days = request.args.get('days', default=None, type=int)
+    today = datetime.date.today()
+    if days is not None:
+        date_list = [(today - datetime.timedelta(days=i)).isoformat() for i in range(days-1, -1, -1)]
+    else:
+        # Use all days from earliest to today
+        rows = db.execute("SELECT timestamp FROM demographics").fetchall()
+        timestamps = [row['timestamp'][:10] for row in rows if row['timestamp'] and len(row['timestamp']) >= 10]
+        if timestamps:
+            first_day = min(timestamps)
+        else:
+            first_day = today.isoformat()
+        d = datetime.date.fromisoformat(first_day)
+        date_list = []
+        while d <= today:
+            date_list.append(d.isoformat())
+            d += datetime.timedelta(days=1)
+
+    # For each day, count users with timestamp <= that day
+    result_counts = []
+    for d in date_list:
+        count = db.execute(
+            "SELECT COUNT(*) FROM demographics WHERE substr(timestamp, 1, 10) <= ?", (d,)
+        ).fetchone()[0]
+        result_counts.append(count)
+
+    return jsonify({'dates': date_list, 'counts': result_counts})
+
+@app.route('/api/fetch_all', methods=['POST'])
+def fetch_all_members():
+    import requests
+    import os
+    import time
+    try:
+        db = get_db()
+        api_token = os.environ.get('NIGHTY_API_TOKEN', 'default_token_change_me')
+        api_url = os.environ.get('NIGHTY_API_BASE_URL', 'http://127.0.0.1:5500') + '/fetch_members'
+        servers = db.execute('SELECT DISTINCT guild_id FROM server_config').fetchall()
+        if not servers:
+            servers = db.execute('SELECT DISTINCT guild_id FROM snapshots').fetchall()
+        count = 0
+        errors = []
+        failed_servers = []
+        for row in servers:
+            guild_id = row['guild_id'] if isinstance(row, dict) else row[0]
+            try:
+                res = requests.post(api_url, headers={
+                    'Authorization': f'Bearer {api_token}',
+                    'Content-Type': 'application/json'
+                }, json={
+                    'guild_id': str(guild_id),
+                    'token': api_token
+                }, timeout=30)
+                if res.status_code == 200:
+                    count += 1
+                else:
+                    errors.append(f'{guild_id}: {res.text[:100]}')
+                    failed_servers.append(str(guild_id))
+            except Exception as e:
+                errors.append(f'{guild_id}: {str(e)}')
+                failed_servers.append(str(guild_id))
+            time.sleep(10)
+        # Send summary webhook
+        summary = f"Fetch All Complete\nSuccess: {count}\nFailed: {len(failed_servers)}"
+        if failed_servers:
+            summary += f"\nFailed Servers: {', '.join(failed_servers)}"
+        embed = {
+            "title": "Fetch All Summary",
+            "description": summary,
+            "color": 0x4caf50 if not failed_servers else 0xf44336
+        }
+        send_webhook_log("", embed=embed)
+        if errors:
+            return {'success': False, 'error': f'Errors for some servers: {errors}', 'count': count}
+        return {'success': True, 'count': count}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+@app.route('/api/validate_database', methods=['POST'])
+def api_validate_database():
+    """API endpoint to validate and repair database schema"""
+    try:
+        with app.app_context():
+            is_valid = validate_and_repair_database()
+            return jsonify({
+                'success': True,
+                'is_valid': is_valid,
+                'message': 'Database validation completed'
+            })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+def remove_emojis_from_text(text):
+    # Emoji unicode ranges (broad, not perfect)
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"  # emoticons
+        "\U0001F300-\U0001F5FF"  # symbols & pictographs
+        "\U0001F680-\U0001F6FF"  # transport & map symbols
+        "\U0001F1E0-\U0001F1FF"  # flags (iOS)
+        "\U00002700-\U000027BF"  # Dingbats
+        "\U0001F900-\U0001F9FF"  # Supplemental Symbols and Pictographs
+        "\U00002600-\U000026FF"  # Misc symbols
+        "\U0001F700-\U0001F77F"  # Alchemical Symbols
+        "\U000024C2-\U0001F251"  # Enclosed characters
+        "]+",
+        flags=re.UNICODE
+    )
+    return emoji_pattern.sub(r'', text)
+
+# Read the file
+with open(__file__, 'r', encoding='utf-8') as f:
+    lines = f.readlines()
+
+# Remove emojis from each line
+new_lines = [remove_emojis_from_text(line) for line in lines]
+
+# Write back to the file
+with open(__file__, 'w', encoding='utf-8') as f:
+    f.writelines(new_lines)
+
+@app.route('/api/tracked_members_over_time_hourly')
+def tracked_members_over_time_hourly():
+    db = get_db()
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    # List of 24 datetimes, one for each hour (on the hour)
+    hours = [(now - datetime.timedelta(hours=i)).replace(minute=0, second=0, microsecond=0) for i in range(23, -1, -1)]
+    hour_labels = [h.strftime('%Y-%m-%d %H:00') for h in hours]
+    counts = []
+    prev_count = 0
+    for h in hours:
+        # Find the latest snapshot at or before this hour
+        row = db.execute(
+            "SELECT member_count FROM snapshots WHERE timestamp <= ? ORDER BY timestamp DESC LIMIT 1",
+            (h.isoformat(),)
+        ).fetchone()
+        if row is not None:
+            prev_count = row[0]
+        counts.append(prev_count)
+    return jsonify({'hours': hour_labels, 'counts': counts})
+
 if __name__ == '__main__':
+    with app.app_context():
+        init_database()
     app.run(debug=True)

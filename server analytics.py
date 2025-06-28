@@ -96,8 +96,11 @@ def server_analytics():
     
     # API configuration
     API_TOKEN = os.environ.get('NIGHTY_API_TOKEN', 'default_token_change_me')
-    API_HOST = '127.0.0.1'
+    API_HOST = '0.0.0.0'  # Bind to all interfaces to allow external access
     API_PORT = 5500
+    
+    # Analytics dashboard configuration
+    ANALYTICS_DASHBOARD_URL = os.environ.get('ANALYTICS_DASHBOARD_URL', 'http://127.0.0.1:5000')
     
     # Timezone offsets (in hours from UTC)
     TIMEZONE_OFFSETS = {
@@ -335,6 +338,7 @@ def server_analytics():
         channel_count = len(guild.channels)
         role_count = len(guild.roles)
         bots = len([m for m in guild.members if m.bot])
+        boosters = getattr(guild, 'premium_subscription_count', 0)
         
         # Insert into SQLite database
         conn = sqlite3.connect(DB_PATH)
@@ -342,8 +346,8 @@ def server_analytics():
         
         # Insert snapshot
         c.execute("""
-            INSERT INTO snapshots (guild_id, guild_name, timestamp, member_count, channel_count, text_channels, voice_channels, categories, role_count, bots, is_auto)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO snapshots (guild_id, guild_name, timestamp, member_count, channel_count, text_channels, voice_channels, categories, role_count, bots, boosters, is_auto)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             str(guild.id),
             guild.name,
@@ -355,11 +359,12 @@ def server_analytics():
             categories,
             role_count,
             bots,
+            boosters,
             int(is_auto)
         ))
         
-        # Get current auto_snapshot setting to preserve it
-        c.execute("SELECT auto_snapshot, chart_style, snapshot_retention_days, auto_snapshot_interval_hours FROM server_config WHERE guild_id = ?", (str(guild.id),))
+        # Get current config, including first_snapshot_date
+        c.execute("SELECT auto_snapshot, chart_style, snapshot_retention_days, auto_snapshot_interval_hours, first_snapshot_date FROM server_config WHERE guild_id = ?", (str(guild.id),))
         config_row = c.fetchone()
         
         if config_row:
@@ -367,13 +372,18 @@ def server_analytics():
             current_chart_style = config_row[1] if config_row[1] else "emoji"
             current_retention_days = config_row[2] if config_row[2] else DATA_RETENTION_DAYS
             current_interval_hours = config_row[3] if config_row[3] else DEFAULT_AUTO_SNAPSHOT_INTERVAL_HOURS
+            current_first_snapshot_date = config_row[4]
         else:
             current_auto_snapshot = 0
             current_chart_style = "emoji"
             current_retention_days = DATA_RETENTION_DAYS
             current_interval_hours = DEFAULT_AUTO_SNAPSHOT_INTERVAL_HOURS
+            current_first_snapshot_date = None
         
-        # Update or create server config - preserve existing auto_snapshot setting
+        # Only set first_snapshot_date if not already set
+        first_snapshot_date_to_set = current_first_snapshot_date or timestamp.isoformat()
+        
+        # Update or create server config - preserve existing auto_snapshot setting and first_snapshot_date
         c.execute("""
             INSERT OR REPLACE INTO server_config (guild_id, auto_snapshot, last_auto_snapshot, first_snapshot_date, chart_style, snapshot_retention_days, auto_snapshot_interval_hours)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -381,7 +391,7 @@ def server_analytics():
             str(guild.id),
             current_auto_snapshot,  # Preserve current auto_snapshot setting
             timestamp.isoformat() if is_auto else None,
-            timestamp.isoformat(),  # first_snapshot_date
+            first_snapshot_date_to_set,  # Only set if not already set
             current_chart_style,
             current_retention_days,
             current_interval_hours
@@ -402,6 +412,7 @@ def server_analytics():
             "text_channels": text_channels,
             "voice_channels": voice_channels,
             "bots": bots,
+            "boosters": boosters,
             "is_auto": is_auto
         }
 
@@ -426,8 +437,16 @@ def server_analytics():
             
         # Take the snapshot silently
         try:
-            await take_snapshot(message.guild, is_auto=True)
+            snapshot_data = await take_snapshot(message.guild, is_auto=True)
             print(f"Auto-snapshot taken for {message.guild.name} (ID: {message.guild.id})", type_="INFO")
+            
+            # Send notification to analytics dashboard
+            await send_analytics_notification(
+                message.guild.id, 
+                message.guild.name, 
+                snapshot_data["member_count"], 
+                is_auto=True
+            )
         except Exception as e:
             print(f"Error taking auto-snapshot: {str(e)}", type_="ERROR")
 
@@ -513,6 +532,7 @@ def server_analytics():
     # Commands
     @bot.command(name="analytics", aliases=["a"], description="Server analytics commands")
     async def analytics_cmd(ctx, *, args: str = ""):
+        create_schema()
         # Store message for later deletion
         cmd_msg = ctx.message
         
@@ -574,11 +594,25 @@ def server_analytics():
 • `<p>analytics boosters` - list all current server boosters
 • `<p>analytics api start` - start the micro-API server manually
 • `<p>analytics api status` - check if API server is running
-• `<p>analytics api stop` - stop the API server
-""")
+• `<p>analytics api stop` - stop the API server""")
             return
         
         if cmd == "snapshot":
+            if subcmd == "all":
+                msg = await ctx.send("Taking snapshot for all servers...")
+                all_guilds = list(bot.guilds)
+                count = 0
+                failed = 0
+                for i, guild in enumerate(all_guilds, 1):
+                    try:
+                        await take_snapshot(guild, is_auto=False)
+                        count += 1
+                        await asyncio.sleep(5)
+                    except Exception as e:
+                        failed += 1
+                        print(f"Failed to snapshot {guild.name}: {e}", type_="ERROR")
+                await msg.edit(content=f"Snapshot complete! Success: {count}, Failed: {failed}, Total: {len(all_guilds)}")
+                return
             msg = await ctx.send("taking snapshot...")
             # Gather snapshot data
             guild = ctx.guild
@@ -598,13 +632,14 @@ def server_analytics():
             channel_count = len(guild.channels)
             role_count = len(guild.roles)
             bots = len([m for m in guild.members if m.bot])
+            boosters = getattr(guild, 'premium_subscription_count', 0)
             is_auto = False
             # Insert into SQLite
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             c.execute("""
-                INSERT INTO snapshots (guild_id, guild_name, timestamp, member_count, channel_count, text_channels, voice_channels, categories, role_count, bots, is_auto)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO snapshots (guild_id, guild_name, timestamp, member_count, channel_count, text_channels, voice_channels, categories, role_count, bots, boosters, is_auto)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 str(guild.id),
                 guild.name,
@@ -616,6 +651,7 @@ def server_analytics():
                 categories,
                 role_count,
                 bots,
+                boosters,
                 int(is_auto)
             ))
             conn.commit()
@@ -626,6 +662,7 @@ def server_analytics():
 **server**: {guild.name}
 **members**: {member_count:,}
 **channels**: {channel_count:,}
+**boosters**: {boosters}
 **time**: {format_time_in_timezone(timestamp, "%H:%M:%S")}""")
             except Exception as e:
                 print(f"Error editing snapshot message: {str(e)}", type_="ERROR")
@@ -687,10 +724,13 @@ def server_analytics():
                 # --- demographics snippet ---
                 demographics_snippet = ""
                 # (Demographics will be refactored separately)
-                booster_count = len(ctx.guild.premium_subscribers)
+                try:
+                    booster_count = ctx.guild.premium_subscription_count
+                except Exception:
+                    booster_count = "?"
                 # Format peak members with difference from current
                 peak_diff_str = f" ({peak_diff:+,})" if peak_diff != 0 else " (0)"
-                report = f"""## server overview\n\n**member statistics**\n• total members: **{current_members:,}**\n• peak members: **{peak_members:,}**{peak_diff_str}\n• bots: **{latest.get('bots', 0):,}**\n• human users: **{latest['member_count'] - latest.get('bots', 0):,}**\n• server boosters: **{booster_count}**\n\n**channel information**\n• total channels: **{latest['channel_count']:,}**\n• text channels: **{latest.get('text_channels', 0):,}**\n• voice channels: **{latest.get('voice_channels', 0):,}**\n• categories: **{latest.get('categories', 0):,}**\n\n**role count**\n• total roles: **{latest['role_count']:,}**\n\n**growth analysis**\n• current trend: **{trend_data['trend'].replace('_', ' ')}**\n• daily change: **{daily_growth_display}** members/day\n• member growth: **{growth:+,}** members total\n• growth rate: **{growth_rate:,.2f}%**\n• next milestone: **{next_milestone:,}** members\n• est. days to milestone: **{days_to_milestone}** days{demographics_snippet}\n\n*last updated: {format_time_in_timezone(datetime.fromisoformat(latest['timestamp']), '%y-%m-%d %h:%m')}*\nserver analytics\n"""
+                report = f"""## server overview\n\n**member statistics**\n• total members: **{current_members:,}**\n• peak members: **{peak_members:,}**{peak_diff_str}\n• bots: **{latest.get('bots', 0):,}**\n• human users: **{latest['member_count'] - latest.get('bots', 0):,}**\n• server boosts: **{booster_count}**\n\n**channel information**\n• total channels: **{latest['channel_count']:,}**\n• text channels: **{latest.get('text_channels', 0):,}**\n• voice channels: **{latest.get('voice_channels', 0):,}**\n• categories: **{latest.get('categories', 0):,}**\n\n**role count**\n• total roles: **{latest['role_count']:,}**\n\n**growth analysis**\n• current trend: **{trend_data['trend'].replace('_', ' ')}**\n• daily change: **{daily_growth_display}** members/day\n• member growth: **{growth:+,}** members total\n• growth rate: **{growth_rate:,.2f}%**\n• next milestone: **{next_milestone:,}** members\n• est. days to milestone: **{days_to_milestone}** days{demographics_snippet}\n\n*last updated: {format_time_in_timezone(datetime.fromisoformat(latest['timestamp']), '%y-%m-%d %h:%m')}*\nserver analytics\n"""
                 await msg.delete()
                 await forwardEmbedMethod(
                     channel_id=ctx.channel.id,
@@ -727,12 +767,29 @@ def server_analytics():
             snap_count = c.fetchone()[0]
             c.execute("SELECT auto_snapshot, last_auto_snapshot, first_snapshot_date, snapshot_retention_days FROM server_config WHERE guild_id = ?", (str(ctx.guild.id),))
             config_row = c.fetchone()
-            conn.close()
             if config_row:
                 auto_snapshot, last_auto_snapshot, first_snapshot_date, retention_days = config_row
             else:
-                auto_snapshot, last_auto_snapshot, first_snapshot_date, retention_days = (0, 'never', 'unknown', DATA_RETENTION_DAYS)
-            msg = f"""**analytics status for {ctx.guild.name}**\n\n• total snapshots: {snap_count}\n• data retention: {retention_days} days\n• auto snapshot: {'enabled' if auto_snapshot else 'disabled'}\n• last auto snapshot: {last_auto_snapshot or 'never'}\n• first snapshot: {first_snapshot_date or 'unknown'}\n"""
+                auto_snapshot, last_auto_snapshot, first_snapshot_date, retention_days = (0, 'never', None, DATA_RETENTION_DAYS)
+
+            # If first_snapshot_date is missing, get it from the earliest snapshot
+            if not first_snapshot_date:
+                c.execute("SELECT MIN(timestamp) FROM snapshots WHERE guild_id = ?", (str(ctx.guild.id),))
+                row = c.fetchone()
+                first_snapshot_date = row[0] if row and row[0] else None
+            conn.close()
+
+            # Format the first snapshot date for display
+            if first_snapshot_date:
+                try:
+                    dt = datetime.fromisoformat(first_snapshot_date)
+                    formatted_first_snapshot = format_time_in_timezone(dt, "%Y-%m-%d %H:%M")
+                except Exception:
+                    formatted_first_snapshot = first_snapshot_date
+            else:
+                formatted_first_snapshot = "unknown"
+
+            msg = f"""**analytics status for {ctx.guild.name}**\n\n• total snapshots: {snap_count}\n• data retention: {retention_days} days\n• auto snapshot: {'enabled' if auto_snapshot else 'disabled'}\n• last auto snapshot: {last_auto_snapshot or 'never'}\n• first snapshot: {formatted_first_snapshot}\n"""
             await ctx.send(msg)
             
         elif cmd == "members":
@@ -979,8 +1036,8 @@ use `<p>analytics auto off` to disable""")
                         members_list = await text_channel.guild.fetch_members()
                         print(f"[DEBUG] fetch_members() returned {len(members_list)} members", type_="INFO")
                         for member in members_list:
-                            c.execute("INSERT OR REPLACE INTO demographics (guild_id, member_id, name, account_created, joined_at) VALUES (?, ?, ?, ?, ?)", (
-                                str(ctx.guild.id), str(member.id), str(member), member.created_at.isoformat() if member.created_at else None, member.joined_at.isoformat() if member.joined_at else None
+                            c.execute("INSERT OR REPLACE INTO demographics (guild_id, member_id, name, account_created, joined_at, timestamp) VALUES (?, ?, ?, ?, ?, ?)", (
+                                str(ctx.guild.id), str(member.id), str(member), member.created_at.isoformat() if member.created_at else None, member.joined_at.isoformat() if member.joined_at else None, datetime.now(timezone.utc).isoformat()
                             ))
                             fetched += 1
                         conn.commit()
@@ -1028,8 +1085,8 @@ use `<p>analytics auto off` to disable""")
                         return
                     members_list = await text_channel.guild.fetch_members()
                     for member in members_list:
-                        c.execute("INSERT OR REPLACE INTO demographics (guild_id, member_id, name, account_created, joined_at) VALUES (?, ?, ?, ?, ?)", (
-                            str(ctx.guild.id), str(member.id), str(member), member.created_at.isoformat() if member.created_at else None, member.joined_at.isoformat() if member.joined_at else None
+                        c.execute("INSERT OR REPLACE INTO demographics (guild_id, member_id, name, account_created, joined_at, timestamp) VALUES (?, ?, ?, ?, ?, ?)", (
+                            str(ctx.guild.id), str(member.id), str(member), member.created_at.isoformat() if member.created_at else None, member.joined_at.isoformat() if member.joined_at else None, datetime.now(timezone.utc).isoformat()
                         ))
                         fetched += 1
                     conn.commit()
@@ -1063,86 +1120,74 @@ use `<p>analytics auto off` to disable""")
                 create_schema()
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
-                
-                # Migration statistics
-                migration_stats = defaultdict(lambda: {
-                    'total': 0, 'success': 0, 'skipped': 0, 'errors': []
-                })
+                # --- Ensure 'timestamp' column exists in demographics (legacy DBs) ---
+                c.execute("PRAGMA table_info(demographics)")
+                demo_columns = [row[1] for row in c.fetchall()]
+                if 'timestamp' not in demo_columns:
+                    try:
+                        c.execute('ALTER TABLE demographics ADD COLUMN timestamp TEXT')
+                        script_log("Added missing 'timestamp' column to demographics table during migration.", level="INFO")
+                    except Exception as e:
+                        script_log(f"Could not add 'timestamp' column to demographics: {e}", level="ERROR", exc_info=True)
+                # --- Snapshots Migration ---
+                snap_path = os.path.join(server_dir, "member_snapshots.json")
+                if os.path.isfile(snap_path):
+                    try:
+                        with open(snap_path, "r", encoding="utf-8") as f:
+                            data = json.load(f).get("snapshots", [])
+                            migration_stats[server_id]['total'] += len(data)
+                            for i, snap in enumerate(data):
+                                try:
+                                    c.execute("""
+                                        INSERT INTO snapshots (guild_id, guild_name, timestamp, member_count, channel_count, text_channels, voice_channels, categories, role_count, bots, boosters, is_auto)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """, (
+                                        server_id, snap.get("name"), snap.get("timestamp"), snap.get("member_count"),
+                                        snap.get("channel_count"), snap.get("text_channels"), snap.get("voice_channels"),
+                                        snap.get("categories"), snap.get("role_count"), snap.get("bots"),
+                                        snap.get("boosters", 0), int(snap.get("is_auto", False))
+                                    ))
+                                    migration_stats[server_id]['success'] += 1
+                                except Exception as e:
+                                    migration_stats[server_id]['skipped'] += 1
+                                    err_msg = f"Skipping malformed snapshot record #{i+1} for server {server_id}: {e}"
+                                    migration_stats[server_id]['errors'].append(err_msg)
+                                    script_log(err_msg, level="ERROR", exc_info=True)
+                    except json.JSONDecodeError as e:
+                        err_msg = f"Could not parse snapshots JSON for server {server_id}: {e}"
+                        migration_stats[server_id]['errors'].append(err_msg)
+                        script_log(err_msg, level="ERROR", exc_info=True)
 
-                # For each server directory
-                if not os.path.isdir(TEST_DATA_DIR):
-                    await msg.edit(content=f"Test data directory not found: {TEST_DATA_DIR}")
-                    return
+                # --- Demographics Migration ---
+                demo_path = os.path.join(server_dir, "member_demographics.json")
+                if os.path.isfile(demo_path):
+                    try:
+                        with open(demo_path, "r", encoding="utf-8") as f:
+                            demo_data = json.load(f)
+                            for member_id, info in demo_data.items():
+                                try:
+                                    c.execute("INSERT OR REPLACE INTO demographics (guild_id, member_id, name, account_created, joined_at, timestamp) VALUES (?, ?, ?, ?, ?, ?)", (server_id, member_id, info.get("name"), info.get("account_created"), info.get("joined_at"), info.get("timestamp") or info.get("joined_at") or info.get("account_created") or datetime.now(timezone.utc).isoformat()))
+                                except Exception as e:
+                                    script_log(f"Skipping malformed demographics record for member {member_id} in server {server_id}: {e}", level="ERROR", exc_info=True)
+                    except json.JSONDecodeError as e:
+                        script_log(f"Could not parse demographics JSON for server {server_id}: {e}", level="ERROR", exc_info=True)
 
-                for server_id in os.listdir(TEST_DATA_DIR):
-                    server_dir = os.path.join(TEST_DATA_DIR, server_id)
-                    if not os.path.isdir(server_dir):
-                        continue
-
-                    script_log(f"Processing server: {server_id}", level="INFO")
-
-                    # --- Snapshots Migration ---
-                    snap_path = os.path.join(server_dir, "member_snapshots.json")
-                    if os.path.isfile(snap_path):
-                        try:
-                            with open(snap_path, "r", encoding="utf-8") as f:
-                                data = json.load(f).get("snapshots", [])
-                                migration_stats[server_id]['total'] += len(data)
-                                for i, snap in enumerate(data):
-                                    try:
-                                        c.execute("""
-                                            INSERT INTO snapshots (guild_id, guild_name, timestamp, member_count, channel_count, text_channels, voice_channels, categories, role_count, bots, is_auto)
-                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                        """, (
-                                            server_id, snap.get("name"), snap.get("timestamp"), snap.get("member_count"),
-                                            snap.get("channel_count"), snap.get("text_channels"), snap.get("voice_channels"),
-                                            snap.get("categories"), snap.get("role_count"), snap.get("bots"),
-                                            int(snap.get("is_auto", False))
-                                        ))
-                                        migration_stats[server_id]['success'] += 1
-                                    except Exception as e:
-                                        migration_stats[server_id]['skipped'] += 1
-                                        err_msg = f"Skipping malformed snapshot record #{i+1} for server {server_id}: {e}"
-                                        migration_stats[server_id]['errors'].append(err_msg)
-                                        script_log(err_msg, level="ERROR", exc_info=True)
-                        except json.JSONDecodeError as e:
-                            err_msg = f"Could not parse snapshots JSON for server {server_id}: {e}"
-                            migration_stats[server_id]['errors'].append(err_msg)
-                            script_log(err_msg, level="ERROR", exc_info=True)
-
-                    # --- Demographics Migration ---
-                    demo_path = os.path.join(server_dir, "member_demographics.json")
-                    if os.path.isfile(demo_path):
-                        try:
-                            with open(demo_path, "r", encoding="utf-8") as f:
-                                demo_data = json.load(f)
-                                for member_id, info in demo_data.items():
-                                    try:
-                                        c.execute("""
-                                            INSERT OR REPLACE INTO demographics (guild_id, member_id, name, account_created, joined_at)
-                                            VALUES (?, ?, ?, ?, ?)
-                                        """, (server_id, member_id, info.get("name"), info.get("account_created"), info.get("joined_at")))
-                                    except Exception as e:
-                                        script_log(f"Skipping malformed demographics record for member {member_id} in server {server_id}: {e}", level="ERROR", exc_info=True)
-                        except json.JSONDecodeError as e:
-                            script_log(f"Could not parse demographics JSON for server {server_id}: {e}", level="ERROR", exc_info=True)
-
-                    # --- Config Migration ---
-                    config_path = os.path.join(server_dir, "analytics_config.json")
-                    if os.path.isfile(config_path):
-                        try:
-                            with open(config_path, "r", encoding="utf-8") as f:
-                                config = json.load(f)
-                            c.execute("""
-                                INSERT OR REPLACE INTO server_config (guild_id, auto_snapshot, last_auto_snapshot, first_snapshot_date, chart_style, snapshot_retention_days, auto_snapshot_interval_hours)
-                                VALUES (?, ?, ?, ?, ?, ?, ?)
-                            """, (
-                                server_id, int(config.get("auto_snapshot", 0)), config.get("last_auto_snapshot"),
-                                config.get("first_snapshot_date"), config.get("chart_style"), config.get("snapshot_retention_days"),
-                                config.get("auto_snapshot_interval_hours")
-                            ))
-                        except Exception as e:
-                            script_log(f"Could not migrate config for server {server_id}: {e}", level="ERROR", exc_info=True)
+                # --- Config Migration ---
+                config_path = os.path.join(server_dir, "analytics_config.json")
+                if os.path.isfile(config_path):
+                    try:
+                        with open(config_path, "r", encoding="utf-8") as f:
+                            config = json.load(f)
+                        c.execute("""
+                            INSERT OR REPLACE INTO server_config (guild_id, auto_snapshot, last_auto_snapshot, first_snapshot_date, chart_style, snapshot_retention_days, auto_snapshot_interval_hours)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            server_id, int(config.get("auto_snapshot", 0)), config.get("last_auto_snapshot"),
+                            config.get("first_snapshot_date"), config.get("chart_style"), config.get("snapshot_retention_days"),
+                            config.get("auto_snapshot_interval_hours")
+                        ))
+                    except Exception as e:
+                        script_log(f"Could not migrate config for server {server_id}: {e}", level="ERROR", exc_info=True)
 
                 # --- Demographics Servers List Migration ---
                 if os.path.isfile(DEMO_SERVERS_FILE):
@@ -1264,55 +1309,50 @@ __Global__
                 processed_count = 0
                 failed_count = 0
                 total_members_fetched = 0
-                
+                processed_guild_ids = set()
                 await msg.edit(content=f"Found {len(unmonitored_guilds)} unmonitored servers. Starting processing with 10-second intervals...")
-                
                 for i, guild in enumerate(unmonitored_guilds, 1):
+                    if str(guild.id) in processed_guild_ids:
+                        print(f"[HOLYLOGGER] Skipping duplicate server {guild.name} (ID: {guild.id})", type_="WARNING")
+                        continue
+                    processed_guild_ids.add(str(guild.id))
                     try:
                         print(f"[HOLYLOGGER] Processing server {i}/{len(unmonitored_guilds)}: {guild.name} (ID: {guild.id})", type_="INFO")
-                        
                         # Take snapshot
                         print(f"[HOLYLOGGER] Taking snapshot for {guild.name}", type_="INFO")
                         await take_snapshot(guild, is_auto=False)
-                        
                         # Wait 5 seconds before fetching members
                         await asyncio.sleep(5)
-                        
                         # Fetch members
                         print(f"[HOLYLOGGER] Fetching members for {guild.name}", type_="INFO")
                         try:
                             members_list = await guild.fetch_members()
                             print(f"[HOLYLOGGER] Fetched {len(members_list)} members from {guild.name}", type_="INFO")
-                            
                             # Insert members into demographics table
                             conn = sqlite3.connect(DB_PATH)
                             c = conn.cursor()
                             fetched_count = 0
                             for member in members_list:
-                                c.execute("INSERT OR REPLACE INTO demographics (guild_id, member_id, name, account_created, joined_at) VALUES (?, ?, ?, ?, ?)", (
+                                c.execute("INSERT OR REPLACE INTO demographics (guild_id, member_id, name, account_created, joined_at, timestamp) VALUES (?, ?, ?, ?, ?, ?)", (
                                     str(guild.id), 
                                     str(member.id), 
                                     str(member), 
                                     member.created_at.isoformat() if member.created_at else None, 
-                                    member.joined_at.isoformat() if member.joined_at else None
+                                    member.joined_at.isoformat() if member.joined_at else None,
+                                    datetime.now(timezone.utc).isoformat()
                                 ))
                                 fetched_count += 1
                             conn.commit()
                             conn.close()
-                            
                             total_members_fetched += fetched_count
                             print(f"[HOLYLOGGER] Inserted {fetched_count} members into database for {guild.name}", type_="INFO")
-                            
                         except Exception as member_error:
                             print(f"[HOLYLOGGER] Failed to fetch members for {guild.name}: {member_error}", type_="ERROR")
-                        
                         processed_count += 1
                         print(f"[HOLYLOGGER] Successfully processed {guild.name} ({processed_count}/{len(unmonitored_guilds)})", type_="INFO")
-                        
                         # Wait 10 seconds before next server (except for the last one)
                         if i < len(unmonitored_guilds):
                             await asyncio.sleep(10)
-                            
                     except Exception as guild_error:
                         failed_count += 1
                         print(f"[HOLYLOGGER] Failed to process {guild.name}: {guild_error}", type_="ERROR")
@@ -1378,17 +1418,18 @@ __Global__
 • `analytics api stop` - Stop the API server""")
 
         elif cmd == "boosters":
-            boosters = ctx.guild.premium_subscribers
+            # Ensure all members are fetched for accuracy
+            members = await ctx.guild.fetch_members()
+            boosters = [member for member in members if member.premium_since]
             if not boosters:
                 await ctx.send("This server has no boosters.")
                 return
-            booster_list = []
-            for booster in boosters:
-                booster_list.append(f"{booster.name} ({booster.id})")
+            booster_list = [f"{booster.name} ({booster.id})" for booster in boosters]
+            footnote = "\n\n*note: this list may not be full and relies on your cached members. some boosters may not appear if they are not cached.*"
             await forwardEmbedMethod(
                 channel_id=ctx.channel.id,
                 title=f"Server Boosters - {ctx.guild.name}",
-                content="\n".join(booster_list)
+                content="\n".join(booster_list) + footnote
             )
         elif cmd == "resetdb" or (cmd == "reset" and subcmd == "database"):
             if subcmd != "confirm" and subarg.lower() != "confirm":
@@ -1396,8 +1437,13 @@ __Global__
                 return
             msg = await ctx.send("Wiping analytics database and all related files...")
             try:
-                # Remove the SQLite DB file
+                # Ensure all SQLite connections are closed before deleting the DB file
                 db_path = os.path.join(getScriptsPath(), "json", "analytics_test.db")
+                try:
+                    sqlite3.connect(db_path).close()
+                except Exception:
+                    pass
+                # Remove the SQLite DB file
                 if os.path.isfile(db_path):
                     os.remove(db_path)
                 # Remove server_member_tracking directory
@@ -1586,9 +1632,13 @@ format: csv (comma-separated values)
     DEMO_SERVERS_FILE = os.path.join(getScriptsPath(), "json", "demographics_servers.json")
 
     def create_schema():
+        """
+        Ensures all required tables and columns exist in the SQLite database, including the 'boosters' and 'timestamp' columns for new DBs. For a fresh DB, the CREATE TABLE statement includes all columns, so ALTER TABLE is not needed. For legacy DBs, this function will add missing columns as needed.
+        """
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
+        # Create table if not exists (fresh DB)
         c.execute('''CREATE TABLE IF NOT EXISTS snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id TEXT,
@@ -1601,16 +1651,28 @@ format: csv (comma-separated values)
             categories INTEGER,
             role_count INTEGER,
             bots INTEGER,
+            boosters INTEGER,
             is_auto INTEGER
         )''')
+        # Check if 'boosters' column exists, add if missing (legacy DB)
+        c.execute("PRAGMA table_info(snapshots)")
+        columns = [row[1] for row in c.fetchall()]
+        if 'boosters' not in columns:
+            try:
+                c.execute('ALTER TABLE snapshots ADD COLUMN boosters INTEGER DEFAULT 0')
+            except Exception as e:
+                print(f"[DB MIGRATION] Could not add 'boosters' column: {e}")
+        # For fresh DBs, boosters column is always present. For legacy DBs, migration should be handled separately.
         c.execute('''CREATE TABLE IF NOT EXISTS demographics (
             guild_id TEXT,
             member_id TEXT,
             name TEXT,
             account_created TEXT,
             joined_at TEXT,
+            timestamp TEXT,
             PRIMARY KEY (guild_id, member_id)
         )''')
+        # For fresh DBs, timestamp column is always present. For legacy DBs, migration should be handled separately.
         c.execute('''CREATE TABLE IF NOT EXISTS server_config (
             guild_id TEXT PRIMARY KEY,
             auto_snapshot INTEGER,
@@ -1732,14 +1794,15 @@ format: csv (comma-separated values)
                 
                 for member in members_list:
                     c.execute("""
-                        INSERT OR REPLACE INTO demographics (guild_id, member_id, name, account_created, joined_at) 
-                        VALUES (?, ?, ?, ?, ?)
+                        INSERT OR REPLACE INTO demographics (guild_id, member_id, name, account_created, joined_at, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?)
                     """, (
-                        str(guild.id), 
-                        str(member.id), 
-                        str(member), 
-                        member.created_at.isoformat() if member.created_at else None, 
-                        member.joined_at.isoformat() if member.joined_at else None
+                        str(guild.id),
+                        str(member.id),
+                        str(member),
+                        member.created_at.isoformat() if member.created_at else None,
+                        member.joined_at.isoformat() if member.joined_at else None,
+                        datetime.now(timezone.utc).isoformat()
                     ))
                     fetched_count += 1
                 
@@ -1766,6 +1829,71 @@ format: csv (comma-separated values)
             print(f"[WebAPI] Error in fetch_members_handler: {e}", type_="ERROR")
             return web.json_response({'error': 'Internal server error'}, status=500)
 
+    async def take_snapshot_handler(request):
+        """Handle POST /take_snapshot requests"""
+        try:
+            # Verify token
+            auth_header = request.headers.get('Authorization')
+            if not auth_header or auth_header != f'Bearer {API_TOKEN}':
+                print(f"[WebAPI] Unauthorized request: {auth_header}", type_="ERROR")
+                return web.json_response({'error': 'Unauthorized'}, status=401)
+            
+            # Parse request body
+            data = await request.json()
+            guild_id = data.get('guild_id')
+            token = data.get('token')
+            manual = data.get('manual', False)
+            print(f"[WebAPI] take_snapshot_handler called with guild_id={guild_id}, manual={manual}", type_="INFO")
+            
+            if not guild_id or not token or token != API_TOKEN:
+                print(f"[WebAPI] Invalid request data: guild_id={guild_id}, token={token}", type_="ERROR")
+                return web.json_response({'error': 'Invalid request data'}, status=400)
+            
+            # Find the guild
+            guild = bot.get_guild(int(guild_id))
+            if not guild:
+                print(f"[WebAPI] Guild not found or not accessible: {guild_id}", type_="ERROR")
+                return web.json_response({'error': 'Guild not found or not accessible'}, status=404)
+            
+            # Take the snapshot
+            try:
+                await take_snapshot(guild, is_auto=not manual)
+                
+                # Get the latest snapshot data
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                latest_snapshot = c.execute(
+                    "SELECT member_count FROM snapshots WHERE guild_id = ? ORDER BY timestamp DESC LIMIT 1",
+                    (str(guild.id),)
+                ).fetchone()
+                conn.close()
+                
+                member_count = latest_snapshot[0] if latest_snapshot else 0
+                
+                print(f"[WebAPI] Successfully took snapshot for {guild.name} with {member_count} members", type_="INFO")
+                
+                # Send notification to analytics dashboard
+                await send_analytics_notification(guild.id, guild.name, member_count, is_auto=not manual)
+                
+                return web.json_response({
+                    'success': True,
+                    'guild_name': guild.name,
+                    'member_count': member_count,
+                    'boosters': getattr(guild, 'premium_subscription_count', 0),
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'message': f'Snapshot taken for {guild.name}'
+                })
+                
+            except Exception as snapshot_error:
+                print(f"[WebAPI] Failed to take snapshot for {guild.name}: {snapshot_error}", type_="ERROR")
+                return web.json_response({
+                    'error': f'Failed to take snapshot: {str(snapshot_error)}'
+                }, status=500)
+                
+        except Exception as e:
+            print(f"[WebAPI] Error in take_snapshot_handler: {e}", type_="ERROR")
+            return web.json_response({'error': 'Internal server error'}, status=500)
+
     async def health_check_handler(request):
         """Handle GET /health requests for testing"""
         return web.json_response({
@@ -1781,6 +1909,7 @@ format: csv (comma-separated values)
             
             app = web.Application()
             app.router.add_post('/fetch_members', fetch_members_handler)
+            app.router.add_post('/take_snapshot', take_snapshot_handler)
             app.router.add_get('/health', health_check_handler)
             
             runner = web.AppRunner(app)
@@ -1792,6 +1921,7 @@ format: csv (comma-separated values)
             print(f"[WebAPI] Available endpoints:", type_="INFO")
             print(f"[WebAPI]   GET  /health - Health check", type_="INFO")
             print(f"[WebAPI]   POST /fetch_members - Fetch members", type_="INFO")
+            print(f"[WebAPI]   POST /take_snapshot - Take snapshot", type_="INFO")
             return runner
             
         except Exception as e:
@@ -1811,5 +1941,35 @@ format: csv (comma-separated values)
         except Exception as e:
             print(f"[WebAPI] Failed to start API server: {e}", type_="ERROR")
             print(f"[WebAPI] Error details: {type(e).__name__}: {str(e)}", type_="ERROR")
+
+    async def send_analytics_notification(guild_id, guild_name, member_count, is_auto=True):
+        """Send notification to analytics dashboard about snapshot taken"""
+        try:
+            notification_data = {
+                'guild_id': str(guild_id),
+                'guild_name': guild_name,
+                'member_count': member_count,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'is_auto': is_auto
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f'{ANALYTICS_DASHBOARD_URL}/api/auto_snapshot_notification',
+                    headers={
+                        'Authorization': f'Bearer {API_TOKEN}',
+                        'Content-Type': 'application/json'
+                    },
+                    json=notification_data,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status == 200:
+                        print(f"[WebAPI] Successfully sent {('auto' if is_auto else 'manual')} snapshot notification to analytics dashboard for {guild_name}", type_="INFO")
+                    else:
+                        print(f"[WebAPI] Failed to send notification to analytics dashboard: HTTP {response.status}", type_="WARNING")
+                        
+        except Exception as e:
+            print(f"[WebAPI] Error sending notification to analytics dashboard: {e}", type_="WARNING")
+            # Don't fail the snapshot if notification fails
 
 server_analytics()  # Initialize the script

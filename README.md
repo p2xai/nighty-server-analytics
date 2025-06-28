@@ -12,36 +12,75 @@
 1. **Clone this repository and enter the folder:**
    ```sh
    git clone https://github.com/p2xai/nighty-server-analytics.git
-   cd nighty-server-analytics/server_analytics
+   cd nighty-server-analytics
    ```
+
 2. **Install dependencies:**
    ```sh
-   pip install flask requests
+   pip install -r requirements.txt
    ```
-3. **Toggle the analytics script in Nighty**
+   Or install manually:
+   ```sh
+   pip install flask requests python-dotenv
+   ```
+
+3. **Copy/Drag `server analytics.py` to your Nighty /scripts folder**
+   ```sh
+   %appdata%\Nighty Selfbot\data\scripts
+   ```
+
+4. **Toggle the analytics script in Nighty**
    ```sh
    # In Discord run:
    <p>analytics api start
    ```
-4. **Start the dashboard:**
+
+5. **Start the dashboard:**
    ```sh
    python analytics_dashboard.py
    ```
-5. **Open your browser:**
+
+6. **Open your browser:**
    - Go to [http://127.0.0.1:5000/](http://127.0.0.1:5000/)
+
+---
+
+## Configuration (Optional)
+
+You can create a `.env` file in the project root to customize settings. A sample configuration file `env.example` is provided - copy it to `.env` and customize as needed:
+
+```env
+# Database path (defaults to ./json/analytics_test.db if not set)
+DB_PATH=/path/to/your/database.db
+
+# API token for micro-API communication
+NIGHTY_API_TOKEN=your_secret_token_here
+
+# Dashboard URL for notifications
+ANALYTICS_DASHBOARD_URL=http://127.0.0.1:5000
+
+# Debug mode
+DEBUG=True
+```
+
+> **Note:** If no `.env` file is present, the system will use default values and work exactly as before.
 
 ---
 
 ## Project Structure
 
 ```
-server_analytics/
+nighty-server-analytics/
   README.md
-  server_analytics.py
+  requirements.txt
+  server analytics.py
   analytics_dashboard.py
-  analytics_test.db (auto-created)
-  server_member_tracking/ (auto-created)
+  .env (optional)
+  json/
+    analytics_test.db (auto-created)
+    global_analytics_webhook.json (auto-created)
 ```
+> **Note:** The database and configuration files are auto-created in the `json/` directory by default.
 
 ---
 
@@ -58,7 +97,7 @@ server_analytics/
 
 ---
 
-## API Endpoints (Dashboard)
+## Dashboard Endpoints
 
 - `/` or `/lander`: Landing page with 24-hour statistics
 - `/dashboard?guild_id=...`: Per-server analytics dashboard
@@ -89,22 +128,6 @@ server_analytics/
 
 ---
 
-## Customization and Extending
-
-- Add new analytics or export features by editing `server_analytics.py`
-- Customize dashboard UI/UX in `analytics_dashboard.py` (HTML/JS is inline)
-- Add new API endpoints as needed for automation or integration
-
----
-
-## Troubleshooting
-
-- **404 or 'Unexpected token <' errors:** Ensure all API endpoints are present and not commented out
-- **Database errors:** Check that `analytics_test.db` is writable and not corrupted
-- **Bot permissions:** The analytics engine must have permission to read members and channels
-- **Webhooks:** Configure via `/analytics-config` for logging
-
----
 
 ## License
 
