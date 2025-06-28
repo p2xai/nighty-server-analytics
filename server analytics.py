@@ -337,7 +337,16 @@ def server_analytics():
         member_count = guild.member_count
         channel_count = len(guild.channels)
         role_count = len(guild.roles)
-        bots = len([m for m in guild.members if m.bot])
+        
+        # Fetch all members to get accurate bot count
+        try:
+            members_list = await guild.fetch_members()
+            bots = len([m for m in members_list if m.bot])
+        except Exception as e:
+            print(f"Error fetching members for bot count in {guild.name}: {e}", type_="ERROR")
+            # Fallback to cached members if fetch fails
+            bots = len([m for m in guild.members if m.bot])
+        
         boosters = getattr(guild, 'premium_subscription_count', 0)
         
         # Insert into SQLite database
@@ -631,7 +640,14 @@ def server_analytics():
             member_count = guild.member_count
             channel_count = len(guild.channels)
             role_count = len(guild.roles)
-            bots = len([m for m in guild.members if m.bot])
+            # Fetch all members to get accurate bot count
+            try:
+                members_list = await guild.fetch_members()
+                bots = len([m for m in members_list if m.bot])
+            except Exception as e:
+                print(f"Error fetching members for bot count in {guild.name}: {e}", type_="ERROR")
+                # Fallback to cached members if fetch fails
+                bots = len([m for m in guild.members if m.bot])
             boosters = getattr(guild, 'premium_subscription_count', 0)
             is_auto = False
             # Insert into SQLite
@@ -662,7 +678,7 @@ def server_analytics():
 **server**: {guild.name}
 **members**: {member_count:,}
 **channels**: {channel_count:,}
-**boosters**: {boosters}
+**boost count**: {boosters}
 **time**: {format_time_in_timezone(timestamp, "%H:%M:%S")}""")
             except Exception as e:
                 print(f"Error editing snapshot message: {str(e)}", type_="ERROR")
@@ -730,7 +746,7 @@ def server_analytics():
                     booster_count = "?"
                 # Format peak members with difference from current
                 peak_diff_str = f" ({peak_diff:+,})" if peak_diff != 0 else " (0)"
-                report = f"""## server overview\n\n**member statistics**\n• total members: **{current_members:,}**\n• peak members: **{peak_members:,}**{peak_diff_str}\n• bots: **{latest.get('bots', 0):,}**\n• human users: **{latest['member_count'] - latest.get('bots', 0):,}**\n• server boosts: **{booster_count}**\n\n**channel information**\n• total channels: **{latest['channel_count']:,}**\n• text channels: **{latest.get('text_channels', 0):,}**\n• voice channels: **{latest.get('voice_channels', 0):,}**\n• categories: **{latest.get('categories', 0):,}**\n\n**role count**\n• total roles: **{latest['role_count']:,}**\n\n**growth analysis**\n• current trend: **{trend_data['trend'].replace('_', ' ')}**\n• daily change: **{daily_growth_display}** members/day\n• member growth: **{growth:+,}** members total\n• growth rate: **{growth_rate:,.2f}%**\n• next milestone: **{next_milestone:,}** members\n• est. days to milestone: **{days_to_milestone}** days{demographics_snippet}\n\n*last updated: {format_time_in_timezone(datetime.fromisoformat(latest['timestamp']), '%y-%m-%d %h:%m')}*\nserver analytics\n"""
+                report = f"""## server overview\n\n**member statistics**\n• total members: **{current_members:,}**\n• peak members: **{peak_members:,}**{peak_diff_str}\n• bots: **{latest.get('bots', 0):,}**\n• human users: **{latest['member_count'] - latest.get('bots', 0):,}**\n• boost count: **{booster_count}**\n\n**channel information**\n• total channels: **{latest['channel_count']:,}**\n• text channels: **{latest.get('text_channels', 0):,}**\n• voice channels: **{latest.get('voice_channels', 0):,}**\n• categories: **{latest.get('categories', 0):,}**\n\n**role count**\n• total roles: **{latest['role_count']:,}**\n\n**growth analysis**\n• current trend: **{trend_data['trend'].replace('_', ' ')}**\n• daily change: **{daily_growth_display}** members/day\n• member growth: **{growth:+,}** members total\n• growth rate: **{growth_rate:,.2f}%**\n• next milestone: **{next_milestone:,}** members\n• est. days to milestone: **{days_to_milestone}** days{demographics_snippet}\n\n*last updated: {format_time_in_timezone(datetime.fromisoformat(latest['timestamp']), '%m/%d/%y %H:%M')}*\nserver analytics\n"""
                 await msg.delete()
                 await forwardEmbedMethod(
                     channel_id=ctx.channel.id,
@@ -891,7 +907,7 @@ def server_analytics():
             long_trend = analyze_growth_trend(snapshots, days=14)
             latest = snapshots[-1]
             current_members = latest["member_count"]
-            trend_content = f"""## member growth analysis\n\n**current members:** {current_members:,}\n\n**short-term trend:** {short_trend["trend"].replace('_', ' ')}\n• daily change: **{short_trend["growth_rate_daily"]:.1f}** members/day\n• 7-day projection: **{short_trend["prediction_7_days"]:,}** members\n• confidence: {short_trend["confidence"]}\n\n**medium-term trend:** {medium_trend["trend"].replace('_', ' ')}\n• daily change: **{medium_trend["growth_rate_daily"]:.1f}** members/day\n• 30-day projection: **{medium_trend["prediction_30_days"]:,}** members\n• confidence: {medium_trend["confidence"]}\n\n**long-term trend:** {long_trend["trend"].replace('_', ' ')}\n• over {long_trend["days_measured"]} days\n• total change: **{long_trend["growth_total"]:+,}** members\n\n*note: projections are estimates based on current trends*\n*last updated: {format_time_in_timezone(datetime.fromisoformat(latest['timestamp']), '%y-%m-%d %h:%m')}*\n"""
+            trend_content = f"""## member growth analysis\n\n**current members:** {current_members:,}\n\n**short-term trend:** {short_trend["trend"].replace('_', ' ')}\n• daily change: **{short_trend["growth_rate_daily"]:.1f}** members/day\n• 7-day projection: **{short_trend["prediction_7_days"]:,}** members\n• confidence: {short_trend["confidence"]}\n\n**medium-term trend:** {medium_trend["trend"].replace('_', ' ')}\n• daily change: **{medium_trend["growth_rate_daily"]:.1f}** members/day\n• 30-day projection: **{medium_trend["prediction_30_days"]:,}** members\n• confidence: {medium_trend["confidence"]}\n\n**long-term trend:** {long_trend["trend"].replace('_', ' ')}\n• over {long_trend["days_measured"]} days\n• total change: **{long_trend["growth_total"]:+,}** members\n\n*note: projections are estimates based on current trends*\n*last updated: {format_time_in_timezone(datetime.fromisoformat(latest['timestamp']), '%m/%d/%y %H:%M')}*\n"""
             await msg.delete()
             await forwardEmbedMethod(
                 channel_id=ctx.channel.id,
@@ -1434,7 +1450,7 @@ __Global__
             members = await ctx.guild.fetch_members()
             boosters = [member for member in members if member.premium_since]
             if not boosters:
-                await ctx.send("this server has no boosters.")
+                await ctx.send("this server has no boosts.")
                 return
             booster_list = [f"{booster.name} ({booster.id})" for booster in boosters]
             footnote = "\n\n*note: this list may not be full and relies on your cached members. some boosters may not appear if they are not cached.*"
