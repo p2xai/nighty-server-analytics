@@ -599,7 +599,7 @@ def server_analytics():
         
         if cmd == "snapshot":
             if subcmd == "all":
-                msg = await ctx.send("Taking snapshot for all servers...")
+                msg = await ctx.send("taking snapshot for all servers...")
                 all_guilds = list(bot.guilds)
                 count = 0
                 failed = 0
@@ -611,7 +611,7 @@ def server_analytics():
                     except Exception as e:
                         failed += 1
                         print(f"Failed to snapshot {guild.name}: {e}", type_="ERROR")
-                await msg.edit(content=f"Snapshot complete! Success: {count}, Failed: {failed}, Total: {len(all_guilds)}")
+                await msg.edit(content=f"snapshot complete! success: {count}, failed: {failed}, total: {len(all_guilds)}")
                 return
             msg = await ctx.send("taking snapshot...")
             # Gather snapshot data
@@ -941,25 +941,37 @@ format: csv (comma-separated values)
         elif cmd == "auto":
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
+            
+            # First, get the current auto-snapshot status
+            c.execute("SELECT auto_snapshot FROM server_config WHERE guild_id = ?", (str(ctx.guild.id),))
+            row = c.fetchone()
+            current_status = bool(row[0]) if row and row[0] is not None else False
+            
             if subcmd in ["on", "true", "yes", "enable", "1"]:
-                c.execute("INSERT OR REPLACE INTO server_config (guild_id, auto_snapshot) VALUES (?, ?)", (str(ctx.guild.id), 1))
-                conn.commit()
-                await ctx.send("automatic daily snapshots enabled")
+                if current_status:
+                    await ctx.send("auto-snapshots are **already** enabled for this server.")
+                else:
+                    c.execute("INSERT OR REPLACE INTO server_config (guild_id, auto_snapshot) VALUES (?, ?)", (str(ctx.guild.id), 1))
+                    conn.commit()
+                    await ctx.send("auto-snapshots enabled for this server.")
             elif subcmd in ["off", "false", "no", "disable", "0"]:
-                c.execute("INSERT OR REPLACE INTO server_config (guild_id, auto_snapshot) VALUES (?, ?)", (str(ctx.guild.id), 0))
-                conn.commit()
-                await ctx.send("automatic daily snapshots disabled")
+                if not current_status:
+                    await ctx.send("auto-snapshots are **already** disabled for this server.")
+                else:
+                    c.execute("INSERT OR REPLACE INTO server_config (guild_id, auto_snapshot) VALUES (?, ?)", (str(ctx.guild.id), 0))
+                    conn.commit()
+                    await ctx.send("auto-snapshots disabled for this server.")
             else:
-                c.execute("SELECT auto_snapshot FROM server_config WHERE guild_id = ?", (str(ctx.guild.id),))
-                row = c.fetchone()
-                is_enabled = bool(row[0]) if row else False
-                status = "enabled" if is_enabled else "disabled"
-                await ctx.send(f""" **auto-snapshot status**
-                
-automatic daily snapshots are currently {status}.
+                # Show current status without making changes
+                status = "enabled" if current_status else "disabled"
+                await ctx.send(f"""**Auto-snapshot Status**
 
-use `<p>analytics auto on` to enable
-use `<p>analytics auto off` to disable""")
+**Current status:** {status}
+
+**Commands:**
+• `<p>analytics auto on` - Enable auto-snapshots
+• `<p>analytics auto off` - Disable auto-snapshots
+• `<p>analytics auto` - Show current status (this message)""")
             conn.close()
 
         elif cmd == "retention":
@@ -1020,7 +1032,7 @@ use `<p>analytics auto off` to disable""")
                 members = [dict(name=row[0], account_created=row[1], joined_at=row[2]) for row in c.fetchall()]
                 print(f"[DEBUG] Read {len(members)} members from SQL for guild {ctx.guild.id}", type_="INFO")
                 if not members:
-                    msg = await ctx.send("No demographics data found. Fetching all members for initial demographics...")
+                    msg = await ctx.send("no demographics data found. fetching all members for initial demographics...")
                     try:
                         fetched = 0
                         # Try to find an accessible text channel
@@ -1042,13 +1054,13 @@ use `<p>analytics auto off` to disable""")
                             fetched += 1
                         conn.commit()
                         print(f"[DEBUG] Inserted {fetched} members into SQL for guild {ctx.guild.id}", type_="INFO")
-                        await msg.edit(content=f"Initial demographics data populated/updated for {fetched} members. Showing summary...")
+                        await msg.edit(content=f"initial demographics data populated/updated for {fetched} members. showing summary...")
                         c.execute("SELECT name, account_created, joined_at FROM demographics WHERE guild_id = ?", (str(ctx.guild.id),))
                         members = [dict(name=row[0], account_created=row[1], joined_at=row[2]) for row in c.fetchall()]
                         print(f"[DEBUG] After insert, {len(members)} members in SQL for guild {ctx.guild.id}", type_="INFO")
                     except Exception as e:
                         print(f"[DEBUG] Exception during demographics fetch/insert: {e}", type_="ERROR")
-                        await msg.edit(content=f"Failed to fetch members: {e}\nIf this is a channel error, try `<p>analytics demographics fetch <channel_id>`. ")
+                        await msg.edit(content=f"Failed to fetch members: {e}\nIf this is a channel error, try `<p>analytics demographics fetch <channel_id>`.")
                         conn.close()
                         return
                 if members:
@@ -1064,7 +1076,7 @@ use `<p>analytics auto off` to disable""")
             elif subcmd == "fetch":
                 # Optionally allow a channel ID: <p>analytics demographics fetch <channel_id>
                 channel_id = subarg.strip() if subarg else None
-                msg = await ctx.send("Fetching all members for demographics...")
+                msg = await ctx.send("fetching all members for demographics...")
                 try:
                     fetched = 0
                     text_channel = None
@@ -1094,7 +1106,7 @@ use `<p>analytics auto off` to disable""")
                     total = c.fetchone()[0]
                     await msg.edit(content=f"Fetched/updated demographics for {fetched} members. Total tracked: {total}.")
                 except Exception as e:
-                    await msg.edit(content=f"Failed to fetch members: {e}\nIf this is a channel error, try `<p>analytics demographics fetch <channel_id>`. ")
+                    await msg.edit(content=f"Failed to fetch members: {e}\nIf this is a channel error, try `<p>analytics demographics fetch <channel_id>`.")
                 conn.close()
             elif subcmd == "list":
                 c.execute("SELECT guild_id FROM demographics_servers")
@@ -1115,7 +1127,7 @@ use `<p>analytics auto off` to disable""")
 
         elif cmd == "migrate":
             os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-            msg = await ctx.send("Starting migration to SQLite DB...")
+            msg = await ctx.send("starting migration to sqlite db...")
             try:
                 create_schema()
                 conn = sqlite3.connect(DB_PATH)
@@ -1275,7 +1287,7 @@ __Global__
             return
 
         elif cmd == "holylogger":
-            msg = await ctx.send("Starting holylogger - scanning all servers for unmonitored ones...")
+            msg = await ctx.send("starting holylogger - scanning all servers for unmonitored ones...")
             try:
                 # Ensure database schema exists
                 create_schema()
@@ -1384,32 +1396,32 @@ __Global__
             if subcmd == "start":
                 try:
                     if hasattr(bot, 'api_runner'):
-                        await ctx.send("API server is already running!")
+                        await ctx.send("api server is already running!")
                         return
                     
-                    await ctx.send("Starting API server...")
+                    await ctx.send("starting api server...")
                     api_runner = await start_api_server()
                     bot.api_runner = api_runner
-                    await ctx.send(f"✅ API server started successfully on {API_HOST}:{API_PORT}")
+                    await ctx.send(f"api server started successfully on {API_HOST}:{API_PORT}")
                 except Exception as e:
-                    await ctx.send(f"❌ Failed to start API server: {e}")
+                    await ctx.send(f"failed to start api server: {e}")
             
             elif subcmd == "status":
                 if hasattr(bot, 'api_runner'):
-                    await ctx.send(f"✅ API server is running on {API_HOST}:{API_PORT}")
+                    await ctx.send(f"api server is running on {API_HOST}:{API_PORT}")
                 else:
-                    await ctx.send("❌ API server is not running")
+                    await ctx.send("api server is not running")
             
             elif subcmd == "stop":
                 if hasattr(bot, 'api_runner'):
                     try:
                         await bot.api_runner.cleanup()
                         delattr(bot, 'api_runner')
-                        await ctx.send("✅ API server stopped")
+                        await ctx.send("api server stopped")
                     except Exception as e:
-                        await ctx.send(f"❌ Failed to stop API server: {e}")
+                        await ctx.send(f"failed to stop api server: {e}")
                 else:
-                    await ctx.send("❌ API server is not running")
+                    await ctx.send("api server is not running")
             
             else:
                 await ctx.send("""**API Commands:**
@@ -1422,7 +1434,7 @@ __Global__
             members = await ctx.guild.fetch_members()
             boosters = [member for member in members if member.premium_since]
             if not boosters:
-                await ctx.send("This server has no boosters.")
+                await ctx.send("this server has no boosters.")
                 return
             booster_list = [f"{booster.name} ({booster.id})" for booster in boosters]
             footnote = "\n\n*note: this list may not be full and relies on your cached members. some boosters may not appear if they are not cached.*"
@@ -1433,9 +1445,16 @@ __Global__
             )
         elif cmd == "resetdb" or (cmd == "reset" and subcmd == "database"):
             if subcmd != "confirm" and subarg.lower() != "confirm":
-                await ctx.send("""⚠️ **DANGER ZONE: Database Reset** ⚠️\n\nThis will **DELETE ALL ANALYTICS DATA** (snapshots, demographics, configs) and cannot be undone.\n\nTo proceed, type:\n`<p>analytics resetdb confirm`\n\n**Are you sure?**""")
+                await ctx.send("""**DANGER ZONE: Database Reset**
+
+This will **DELETE ALL ANALYTICS DATA** (snapshots, demographics, configs) and cannot be undone.
+
+To proceed, type:
+`<p>analytics resetdb confirm`
+
+**Are you sure?**""")
                 return
-            msg = await ctx.send("Wiping analytics database and all related files...")
+            msg = await ctx.send("wiping analytics database and all related files...")
             try:
                 # Ensure all SQLite connections are closed before deleting the DB file
                 db_path = os.path.join(getScriptsPath(), "json", "analytics_test.db")
@@ -1456,9 +1475,9 @@ __Global__
                     os.remove(demo_servers_file)
                 # Recreate empty DB
                 create_schema()
-                await msg.edit(content="✅ Analytics database and all related files have been wiped. The system is now reset. You may need to refresh the dashboard UI.")
+                await msg.edit(content="Analytics database and all related files have been wiped. The system is now reset. You may need to refresh the dashboard UI.")
             except Exception as e:
-                await msg.edit(content=f"❌ Failed to reset database: {e}")
+                await msg.edit(content=f"Failed to reset database: {e}")
 
         else:
             await ctx.send(f'command "{user_input}" not found, use analytics help for a list of commands.')
